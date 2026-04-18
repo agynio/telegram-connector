@@ -86,6 +86,28 @@ functions:
     )"
 
 deployments:
+  telegram-mock:
+    namespace: ${TELEGRAM_CONNECTOR_NAMESPACE}
+    helm:
+      chart:
+        name: component-chart
+        repo: https://charts.devspace.sh
+      values:
+        containers:
+          - image: ${E2E_IMAGE}
+            env:
+              - name: TELEGRAM_MOCK_ADDRESS
+                value: ":8443"
+            ports:
+              - name: http
+                containerPort: 8443
+        service:
+          ports:
+            - name: http
+              port: 8443
+              targetPort: 8443
+        labels:
+          app.kubernetes.io/name: telegram-mock
   e2e-runner:
     namespace: ${TELEGRAM_CONNECTOR_NAMESPACE}
     helm:
@@ -98,6 +120,16 @@ deployments:
             env:
               - name: TELEGRAM_CONNECTOR_ADDRESS
                 value: "telegram-connector:8080"
+              - name: TELEGRAM_MOCK_ADDRESS
+                value: "telegram-mock:8443"
+              - name: APPS_ADDRESS
+                value: "apps:50051"
+              - name: THREADS_ADDRESS
+                value: "threads:50051"
+              - name: FILES_ADDRESS
+                value: "files:50051"
+              - name: NOTIFICATIONS_ADDRESS
+                value: "notifications:50051"
         labels:
           app.kubernetes.io/name: telegram-connector-e2e
 
@@ -137,16 +169,23 @@ pipelines:
 
   test:e2e:
     run: |-
-      create_deployments e2e-runner
+      kubectl set env deployment telegram-connector-telegram-connector -n ${TELEGRAM_CONNECTOR_NAMESPACE} TELEGRAM_BASE_URL=http://telegram-mock:8443
+      kubectl rollout status deployment telegram-connector-telegram-connector -n ${TELEGRAM_CONNECTOR_NAMESPACE} --timeout=120s
+      create_deployments telegram-mock e2e-runner
+      start_dev telegram-mock &
       start_dev e2e-runner &
       sleep 5
       exec_container \
         --label-selector "app.kubernetes.io/name=telegram-connector-e2e" \
         -n ${TELEGRAM_CONNECTOR_NAMESPACE} \
-        -- bash -c 'cd /opt/app/data && buf generate --template buf.gen.e2e.yaml buf.build/agynio/api --path agynio/api/apps/v1/apps.proto --path agynio/api/files/v1/files.proto --path agynio/api/threads/v1/threads.proto --path agynio/api/notifications/v1/notifications.proto --path agynio/api/gateway/v1/apps.proto --path agynio/api/gateway/v1/files.proto --path agynio/api/gateway/v1/threads.proto --path agynio/api/gateway/v1/notifications.proto && go test -v -count=1 -tags e2e ./test/e2e/'
+        -- bash -c 'cd /opt/app/data && buf generate --template buf.gen.e2e.yaml buf.build/agynio/api --path agynio/api/apps/v1/apps.proto --path agynio/api/files/v1/files.proto --path agynio/api/threads/v1/threads.proto --path agynio/api/notifications/v1/notifications.proto && go test -v -count=1 -tags e2e ./test/e2e/'
       EXIT_CODE=$?
+      stop_dev telegram-mock
       stop_dev e2e-runner
+      purge_deployments telegram-mock
       purge_deployments e2e-runner
+      kubectl set env deployment telegram-connector-telegram-connector -n ${TELEGRAM_CONNECTOR_NAMESPACE} TELEGRAM_BASE_URL=https://api.telegram.org
+      kubectl rollout status deployment telegram-connector-telegram-connector -n ${TELEGRAM_CONNECTOR_NAMESPACE} --timeout=120s
       exit $EXIT_CODE
 
 hooks:
@@ -189,6 +228,30 @@ dev:
           lastLines: 200
     ports:
       - port: "8080"
+
+  telegram-mock:
+    namespace: ${TELEGRAM_CONNECTOR_NAMESPACE}
+    labelSelector:
+      app.kubernetes.io/name: telegram-mock
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        elapsed=0
+        while [ ! -f /opt/app/data/go.mod ]; do
+          sleep 1; elapsed=$((elapsed + 1))
+          [ "$elapsed" -ge 120 ] && { echo "ERROR: sync timeout" >&2; exit 1; }
+        done
+        exec go run ./test/e2e/telegram-mock
+    workingDir: /opt/app/data
+    sync:
+      - path: ./:/opt/app/data
+        excludePaths:
+          - .git/
+          - .devspace/
+          - /.gen/
+          - /tmp/
 
   e2e-runner:
     namespace: ${TELEGRAM_CONNECTOR_NAMESPACE}
