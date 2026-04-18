@@ -17,7 +17,7 @@ import (
 const inboundRetryDelay = time.Second
 
 func (w *installationWorker) runInbound(ctx context.Context) error {
-	lastUpdateID, err := w.store.GetInstallationState(ctx, w.installation.ID)
+	lastUpdateID, err := w.loadInstallationState(ctx)
 	if err != nil {
 		return err
 	}
@@ -61,13 +61,38 @@ func (w *installationWorker) runInbound(ctx context.Context) error {
 			continue
 		}
 		if maxUpdateID > lastUpdateID {
-			if err := w.store.UpsertInstallationState(ctx, w.installation.ID, maxUpdateID); err != nil {
-				log.Printf("connector: update installation state error: %v", err)
-			} else {
-				lastUpdateID = maxUpdateID
-				offset = lastUpdateID + 1
+			if err := w.persistInstallationState(ctx, maxUpdateID); err != nil {
+				return err
 			}
+			lastUpdateID = maxUpdateID
+			offset = lastUpdateID + 1
 		}
+	}
+}
+
+func (w *installationWorker) loadInstallationState(ctx context.Context) (int64, error) {
+	for {
+		state, err := w.store.GetInstallationState(ctx, w.installation.ID)
+		if err == nil {
+			return state, nil
+		}
+		log.Printf("connector: get installation state error: %v", err)
+		if !sleepContext(ctx, inboundRetryDelay) {
+			return 0, ctx.Err()
+		}
+	}
+}
+
+func (w *installationWorker) persistInstallationState(ctx context.Context, updateID int64) error {
+	for {
+		if err := w.store.UpsertInstallationState(ctx, w.installation.ID, updateID); err != nil {
+			log.Printf("connector: update installation state error: %v", err)
+			if !sleepContext(ctx, inboundRetryDelay) {
+				return ctx.Err()
+			}
+			continue
+		}
+		return nil
 	}
 }
 

@@ -45,7 +45,7 @@ func ApplyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 			if err != nil {
 				return fmt.Errorf("read migration %s: %w", version, err)
 			}
-			if _, err := tx.Exec(ctx, string(content)); err != nil {
+			if err := execMigration(ctx, tx, string(content)); err != nil {
 				return fmt.Errorf("apply migration %s: %w", version, err)
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, version); err != nil {
@@ -54,4 +54,11 @@ func ApplyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 		return nil
 	})
+}
+
+func execMigration(ctx context.Context, tx pgx.Tx, sql string) error {
+	if _, err := tx.Conn().PgConn().Exec(ctx, sql).ReadAll(); err != nil {
+		return err
+	}
+	return nil
 }

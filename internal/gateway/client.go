@@ -42,11 +42,6 @@ func NewZitiHTTPClient(zitiCtx ziti.Context) *http.Client {
 	return &http.Client{Transport: transport}
 }
 
-func NewDialHTTPClient(dialer func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Client {
-	transport := &http.Transport{DialContext: dialer}
-	return &http.Client{Transport: transport}
-}
-
 func NewClient(httpClient connect.HTTPClient, baseURL, appIdentityID string) *Client {
 	return &Client{
 		appIdentityID: appIdentityID,

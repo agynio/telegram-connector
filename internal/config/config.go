@@ -59,7 +59,7 @@ func FromEnv() (Config, error) {
 	}
 	pollTimeout := os.Getenv("TELEGRAM_POLL_TIMEOUT")
 	if pollTimeout == "" {
-		cfg.TelegramPollTimeout = 25 * time.Second
+		cfg.TelegramPollTimeout = 30 * time.Second
 	} else {
 		parsed, err := time.ParseDuration(pollTimeout)
 		if err != nil {

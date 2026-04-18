@@ -80,41 +80,49 @@ func (w *installationWorker) processOutbound(ctx context.Context) {
 		return
 	}
 	for _, message := range messages {
+		shouldAck := false
 		if message.GetSenderId() == w.gateway.AppIdentityID() {
-			w.ackMessage(ctx, message.GetId())
-			continue
+			shouldAck = true
 		}
-		threadID, err := uuid.Parse(message.GetThreadId())
-		if err != nil {
-			log.Printf("connector: invalid thread id %s: %v", message.GetThreadId(), err)
-			w.ackMessage(ctx, message.GetId())
-			continue
-		}
-		mapping, found, err := w.store.GetChatMappingByThreadID(ctx, w.installation.ID, threadID)
-		if err != nil {
-			log.Printf("connector: get chat mapping error: %v", err)
-			w.ackMessage(ctx, message.GetId())
-			continue
-		}
-		if !found {
-			log.Printf("connector: no chat mapping for thread %s", message.GetThreadId())
-			w.ackMessage(ctx, message.GetId())
-			continue
-		}
-		if mapping.BlockedAt != nil {
-			w.ackMessage(ctx, message.GetId())
-			continue
-		}
-		blocked, err := w.deliverOutboundMessage(ctx, mapping, message)
-		if blocked {
-			if err := w.store.MarkChatBlocked(ctx, w.installation.ID, mapping.TelegramChatID); err != nil {
-				log.Printf("connector: mark chat blocked error: %v", err)
+		if !shouldAck {
+			threadID, err := uuid.Parse(message.GetThreadId())
+			if err != nil {
+				log.Printf("connector: invalid thread id %s: %v", message.GetThreadId(), err)
+				shouldAck = true
+			} else {
+				mapping, found, err := w.store.GetChatMappingByThreadID(ctx, w.installation.ID, threadID)
+				if err != nil {
+					log.Printf("connector: get chat mapping error: %v", err)
+					return
+				}
+				if !found {
+					log.Printf("connector: no chat mapping for thread %s", message.GetThreadId())
+					shouldAck = true
+				} else if mapping.BlockedAt != nil {
+					shouldAck = true
+				} else {
+					blocked, err := w.deliverOutboundMessage(ctx, mapping, message)
+					if blocked {
+						if err := w.store.MarkChatBlocked(ctx, w.installation.ID, mapping.TelegramChatID); err != nil {
+							log.Printf("connector: mark chat blocked error: %v", err)
+						}
+						shouldAck = true
+					}
+					if err != nil {
+						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+							return
+						}
+						log.Printf("connector: deliver outbound error: %v", err)
+						shouldAck = true
+					} else {
+						shouldAck = true
+					}
+				}
 			}
 		}
-		if err != nil {
-			log.Printf("connector: deliver outbound error: %v", err)
+		if shouldAck {
+			w.ackMessage(ctx, message.GetId())
 		}
-		w.ackMessage(ctx, message.GetId())
 	}
 }
 
@@ -170,11 +178,7 @@ func (w *installationWorker) sendPlatformFile(ctx context.Context, chatID int64,
 }
 
 func (w *installationWorker) sendGatewayFile(ctx context.Context, chatID int64, fileID string) (bool, error) {
-	metadata, err := w.gateway.GetFileMetadata(ctx, fileID)
-	if err != nil {
-		return false, err
-	}
-	payload, err := w.gateway.GetFileContent(ctx, fileID)
+	metadata, payload, err := w.fetchGatewayFile(ctx, fileID)
 	if err != nil {
 		return false, err
 	}
@@ -187,6 +191,32 @@ func (w *installationWorker) sendGatewayFile(ctx context.Context, chatID int64, 
 	return w.sendWithRetry(ctx, func(ctx context.Context) error {
 		return w.telegramClient.SendFile(ctx, method, field, chatID, filename, contentType, payload)
 	})
+}
+
+func (w *installationWorker) fetchGatewayFile(ctx context.Context, fileID string) (*filesv1.FileInfo, []byte, error) {
+	attempts := 0
+	for {
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+		metadata, err := w.gateway.GetFileMetadata(ctx, fileID)
+		if err == nil {
+			payload, payloadErr := w.gateway.GetFileContent(ctx, fileID)
+			if payloadErr == nil {
+				return metadata, payload, nil
+			}
+			err = fmt.Errorf("get file content: %w", payloadErr)
+		} else {
+			err = fmt.Errorf("get file metadata: %w", err)
+		}
+		attempts++
+		if attempts > outboundRetryMax {
+			return nil, nil, err
+		}
+		if !sleepContext(ctx, retryDelay(attempts)) {
+			return nil, nil, ctx.Err()
+		}
+	}
 }
 
 func (w *installationWorker) sendWithRetry(ctx context.Context, send func(context.Context) error) (bool, error) {

@@ -93,7 +93,16 @@ func (s *Service) listInstallations(ctx context.Context) ([]Installation, error)
 	for _, installation := range installations {
 		parsed, err := s.parseInstallation(ctx, installation)
 		if err != nil {
-			return nil, err
+			installationID := ""
+			appID := ""
+			if installation != nil {
+				appID = installation.GetAppId()
+				if installation.GetMeta() != nil {
+					installationID = installation.GetMeta().GetId()
+				}
+			}
+			log.Printf("connector: skip installation %s (app %s): %v", installationID, appID, err)
+			continue
 		}
 		resolved = append(resolved, parsed)
 	}
