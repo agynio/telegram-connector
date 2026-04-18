@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      - name: Install buf
+        uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          version: 1.66.0
+
+      - name: Generate protobuf bindings
+        run: |
+          buf generate buf.build/agynio/api \
+            --path agynio/api/apps/v1/apps.proto \
+            --path agynio/api/files/v1/files.proto \
+            --path agynio/api/threads/v1/threads.proto \
+            --path agynio/api/notifications/v1/notifications.proto \
+            --path agynio/api/gateway/v1/apps.proto \
+            --path agynio/api/gateway/v1/files.proto \
+            --path agynio/api/gateway/v1/threads.proto \
+            --path agynio/api/gateway/v1/notifications.proto
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build
+        run: go build ./...

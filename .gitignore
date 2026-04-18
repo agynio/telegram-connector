@@ -1,0 +1,11 @@
+/telegram-connector
+/dist/
+.idea/
+.vscode/
+.DS_Store
+charts/telegram-connector/charts/
+charts/telegram-connector/Chart.lock
+.devspace/
+.env
+.env.*
+.gen/

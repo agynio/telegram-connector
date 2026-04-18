@@ -1,0 +1,205 @@
+version: v2beta1
+
+vars:
+  TELEGRAM_CONNECTOR_NAMESPACE: platform
+  E2E_IMAGE: ghcr.io/agynio/devcontainer-go:1
+
+functions:
+  disable_argocd_sync: |-
+    if kubectl get application telegram-connector -n argocd >/dev/null 2>&1; then
+      echo "Disabling ArgoCD auto-sync for telegram-connector..."
+      kubectl patch application telegram-connector -n argocd \
+        --type merge \
+        -p '{"spec":{"syncPolicy":{"automated":null}}}'
+      echo "ArgoCD auto-sync disabled."
+    else
+      echo "WARNING: ArgoCD Application 'telegram-connector' not found in argocd namespace."
+    fi
+  restore_argocd_sync: &restore_argocd_sync |-
+    if kubectl get application telegram-connector -n argocd >/dev/null 2>&1; then
+      echo "Re-enabling ArgoCD auto-sync for telegram-connector..."
+      kubectl patch application telegram-connector -n argocd \
+        --type merge \
+        -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
+      echo "ArgoCD auto-sync restored."
+    else
+      echo "WARNING: ArgoCD Application 'telegram-connector' not found in argocd namespace."
+    fi
+  patch_deployment: |-
+    echo "Patching telegram-connector deployment for DevSpace..."
+    kubectl patch deployment telegram-connector-telegram-connector -n ${TELEGRAM_CONNECTOR_NAMESPACE} --type strategic --patch "$(cat <<'EOF'
+    spec:
+      template:
+        spec:
+          securityContext:
+            runAsUser: 1000
+            fsGroup: 1000
+          initContainers: []
+          volumes:
+            - name: data
+              emptyDir: {}
+          containers:
+            - name: telegram-connector
+              image: ghcr.io/agynio/devcontainer-go:1 # keep in sync with E2E_IMAGE
+              workingDir: /opt/app/data
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  elapsed=0
+                  while [ ! -f /opt/app/data/go.mod ]; do
+                    sleep 1; elapsed=$((elapsed + 1))
+                    [ "$elapsed" -ge 120 ] && { echo "ERROR: sync timeout" >&2; exit 1; }
+                  done
+                  buf generate buf.build/agynio/api \
+                    --path agynio/api/apps/v1/apps.proto \
+                    --path agynio/api/files/v1/files.proto \
+                    --path agynio/api/threads/v1/threads.proto \
+                    --path agynio/api/notifications/v1/notifications.proto \
+                    --path agynio/api/gateway/v1/apps.proto \
+                    --path agynio/api/gateway/v1/files.proto \
+                    --path agynio/api/gateway/v1/threads.proto \
+                    --path agynio/api/gateway/v1/notifications.proto
+                  exec go run ./cmd/telegram-connector
+              volumeMounts:
+                - name: data
+                  mountPath: /opt/app/data
+              resources:
+                requests:
+                  cpu: 500m
+                  memory: 1Gi
+                limits:
+                  cpu: "2"
+                  memory: 4Gi
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 1000
+                runAsGroup: 1000
+                readOnlyRootFilesystem: false
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+    EOF
+    )"
+
+deployments:
+  e2e-runner:
+    namespace: ${TELEGRAM_CONNECTOR_NAMESPACE}
+    helm:
+      chart:
+        name: component-chart
+        repo: https://charts.devspace.sh
+      values:
+        containers:
+          - image: ${E2E_IMAGE}
+            env:
+              - name: TELEGRAM_CONNECTOR_ADDRESS
+                value: "telegram-connector:8080"
+        labels:
+          app.kubernetes.io/name: telegram-connector-e2e
+
+commands:
+  test:e2e: |-
+    devspace run-pipeline test:e2e $@
+
+pipelines:
+  dev:
+    flags:
+      - name: watch
+        short: w
+        description: "Keep DevSpace running and stream logs"
+    run: |-
+      disable_argocd_sync
+      patch_deployment
+      if [ "$(get_flag "watch")" == "true" ]; then
+        start_dev --disable-pod-replace telegram-connector
+      else
+        start_dev --disable-pod-replace telegram-connector
+        echo "Waiting for telegram-connector to be healthy on :8080..."
+        healthy=false
+        for i in $(seq 1 60); do
+          if exec_container --label-selector=app.kubernetes.io/name=telegram-connector -n ${TELEGRAM_CONNECTOR_NAMESPACE} -- bash -c 'nc -z localhost 8080 >/dev/null 2>&1 || (echo > /dev/tcp/localhost/8080) >/dev/null 2>&1'; then
+            healthy=true
+            break
+          fi
+          sleep 2
+        done
+        if [ "$healthy" != "true" ]; then
+          echo "ERROR: telegram-connector did not become healthy within 120s" >&2
+          exit 1
+        fi
+        echo "Dev environment ready. Stopping dev session."
+        stop_dev telegram-connector
+      fi
+
+  test:e2e:
+    run: |-
+      create_deployments e2e-runner
+      start_dev e2e-runner &
+      sleep 5
+      exec_container \
+        --label-selector "app.kubernetes.io/name=telegram-connector-e2e" \
+        -n ${TELEGRAM_CONNECTOR_NAMESPACE} \
+        -- bash -c 'cd /opt/app/data && buf generate --template buf.gen.e2e.yaml buf.build/agynio/api --path agynio/api/apps/v1/apps.proto --path agynio/api/files/v1/files.proto --path agynio/api/threads/v1/threads.proto --path agynio/api/notifications/v1/notifications.proto --path agynio/api/gateway/v1/apps.proto --path agynio/api/gateway/v1/files.proto --path agynio/api/gateway/v1/threads.proto --path agynio/api/gateway/v1/notifications.proto && go test -v -count=1 -tags e2e ./test/e2e/'
+      EXIT_CODE=$?
+      stop_dev e2e-runner
+      purge_deployments e2e-runner
+      exit $EXIT_CODE
+
+hooks:
+  - name: restore-argocd-auto-sync
+    events:
+      - after:dev:telegram-connector
+    command: bash
+    args:
+      - -c
+      - *restore_argocd_sync
+
+dev:
+  telegram-connector:
+    namespace: ${TELEGRAM_CONNECTOR_NAMESPACE}
+    labelSelector:
+      app.kubernetes.io/name: telegram-connector
+      app.kubernetes.io/instance: telegram-connector
+    containers:
+      telegram-connector:
+        container: telegram-connector
+        sync:
+          - path: ./:/opt/app/data
+            excludePaths:
+              - .git/
+              - .devspace/
+              - /.gen/
+              - /tmp/
+            uploadExcludePaths:
+              - .git/
+              - .devspace/
+              - /.gen/
+              - /tmp/
+            downloadExcludePaths:
+              - .git/
+              - .devspace/
+              - /.gen/
+              - /tmp/
+        logs:
+          enabled: true
+          lastLines: 200
+    ports:
+      - port: "8080"
+
+  e2e-runner:
+    namespace: ${TELEGRAM_CONNECTOR_NAMESPACE}
+    labelSelector:
+      app.kubernetes.io/name: telegram-connector-e2e
+    command: ["sleep", "infinity"]
+    workingDir: /opt/app/data
+    sync:
+      - path: ./:/opt/app/data
+        excludePaths:
+          - .git/
+          - .devspace/
+          - /.gen/
+          - /tmp/
