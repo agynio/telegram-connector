@@ -1,0 +1,34 @@
+version: v2
+
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/agynio/telegram-connector/.gen/go
+
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: .gen/go
+    opt:
+      - paths=source_relative
+  - remote: buf.build/grpc/go
+    out: .gen/go
+    opt:
+      - paths=source_relative
+      - require_unimplemented_servers=false
+  - remote: buf.build/connectrpc/go
+    out: .gen/go
+    opt:
+      - paths=source_relative
+
+inputs:
+  - module: buf.build/agynio/api
+    paths:
+      - agynio/api/apps/v1/apps.proto
+      - agynio/api/files/v1/files.proto
+      - agynio/api/threads/v1/threads.proto
+      - agynio/api/notifications/v1/notifications.proto
+      - agynio/api/gateway/v1/apps.proto
+      - agynio/api/gateway/v1/files.proto
+      - agynio/api/gateway/v1/threads.proto
+      - agynio/api/gateway/v1/notifications.proto
