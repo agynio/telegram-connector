@@ -20,7 +20,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	appsv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/apps/v1"
 	filesv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/files/v1"
 	notificationsv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/notifications/v1"
 	threadsv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/threads/v1"
@@ -85,15 +84,6 @@ func envOrDefault(key, fallback string) string {
 	return fallback
 }
 
-func requireEnv(key string) string {
-	value, ok := os.LookupEnv(key)
-	if !ok || value == "" {
-		fmt.Fprintf(os.Stderr, "e2e setup: missing %s\n", key)
-		os.Exit(1)
-	}
-	return value
-}
-
 func waitForHealthy(url string, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -108,52 +98,6 @@ func waitForHealthy(url string, timeout time.Duration) {
 	}
 	fmt.Fprintf(os.Stderr, "e2e setup: %s not healthy within %s\n", url, timeout)
 	os.Exit(1)
-}
-
-func resolveApp(ctx context.Context, slug string) (*appsv1.App, error) {
-	resp, err := appsClient.GetAppBySlug(ctx, &appsv1.GetAppBySlugRequest{
-		OrganizationId: organizationID,
-		Slug:           slug,
-	})
-	if err == nil && resp.GetApp() != nil {
-		return resp.GetApp(), nil
-	}
-	apps, listErr := listApps(ctx)
-	if listErr != nil {
-		if err != nil {
-			return nil, fmt.Errorf("get app by slug %s: %w", slug, err)
-		}
-		return nil, listErr
-	}
-	for _, app := range apps {
-		if strings.Contains(app.GetSlug(), slug) || strings.Contains(app.GetSlug(), "telegram") {
-			return app, nil
-		}
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get app by slug %s: %w", slug, err)
-	}
-	return nil, fmt.Errorf("app %s not found", slug)
-}
-
-func listApps(ctx context.Context) ([]*appsv1.App, error) {
-	apps := make([]*appsv1.App, 0)
-	pageToken := ""
-	for {
-		resp, err := appsClient.ListApps(ctx, &appsv1.ListAppsRequest{
-			OrganizationId: organizationID,
-			PageSize:       100,
-			PageToken:      pageToken,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("list apps: %w", err)
-		}
-		apps = append(apps, resp.GetApps()...)
-		pageToken = resp.GetNextPageToken()
-		if pageToken == "" {
-			return apps, nil
-		}
-	}
 }
 
 func resetTelegramMockToken(token string) error {

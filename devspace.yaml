@@ -86,6 +86,118 @@ functions:
     )"
 
 deployments:
+  telegram-connector-db:
+    namespace: ${TELEGRAM_CONNECTOR_NAMESPACE}
+    helm:
+      chart:
+        name: component-chart
+        repo: https://charts.devspace.sh
+      values:
+        containers:
+          - image: postgres:16-alpine
+            env:
+              - name: POSTGRES_DB
+                value: telegram_connector
+              - name: POSTGRES_USER
+                value: telegram
+              - name: POSTGRES_PASSWORD
+                value: telegram
+            ports:
+              - name: postgres
+                containerPort: 5432
+        service:
+          ports:
+            - name: postgres
+              port: 5432
+              targetPort: 5432
+  telegram-connector:
+    namespace: ${TELEGRAM_CONNECTOR_NAMESPACE}
+    helm:
+      chart:
+        name: component-chart
+        repo: https://charts.devspace.sh
+      values:
+        containers:
+          - name: telegram-connector
+            image: ${E2E_IMAGE}
+            workingDir: /opt/app/data
+            command:
+              - bash
+              - -c
+              - |
+                set -eu
+                elapsed=0
+                while [ ! -f /opt/app/data/go.mod ]; do
+                  sleep 1; elapsed=$((elapsed + 1))
+                  [ "$elapsed" -ge 120 ] && { echo "ERROR: sync timeout" >&2; exit 1; }
+                done
+                if [ ! -f /opt/app/data/.gen/go/agynio/api/apps/v1/apps.pb.go ]; then
+                  elapsed=0
+                  while [ ! -f /opt/app/data/.gen/go/agynio/api/apps/v1/apps.pb.go ] && [ "$elapsed" -lt 30 ]; do
+                    sleep 1; elapsed=$((elapsed + 1))
+                  done
+                fi
+                if [ ! -f /opt/app/data/.gen/go/agynio/api/apps/v1/apps.pb.go ]; then
+                  buf generate buf.build/agynio/api \
+                    --path agynio/api/apps/v1/apps.proto \
+                    --path agynio/api/files/v1/files.proto \
+                    --path agynio/api/threads/v1/threads.proto \
+                    --path agynio/api/notifications/v1/notifications.proto \
+                    --path agynio/api/gateway/v1/apps.proto \
+                    --path agynio/api/gateway/v1/files.proto \
+                    --path agynio/api/gateway/v1/threads.proto \
+                    --path agynio/api/gateway/v1/notifications.proto
+                fi
+                elapsed=0
+                until (echo > /dev/tcp/telegram-connector-db/5432) >/dev/null 2>&1; do
+                  sleep 2; elapsed=$((elapsed + 2))
+                  [ "$elapsed" -ge 120 ] && { echo "ERROR: postgres not ready" >&2; exit 1; }
+                done
+                exec go run ./cmd/telegram-connector
+            env:
+              - name: HTTP_ADDRESS
+                value: ":8080"
+              - name: DATABASE_URL
+                value: "postgres://telegram:telegram@telegram-connector-db:5432/telegram_connector?sslmode=disable"
+              - name: ZITI_IDENTITY_FILE
+                value: "/ziti/identity.json"
+              - name: SERVICE_TOKEN
+                value: ""
+              - name: GATEWAY_URL
+                value: "http://gateway-gateway:8080"
+              - name: ZITI_SERVICE_NAME
+                value: "app-telegram-e2e"
+              - name: GATEWAY_SERVICE_NAME
+                value: "gateway"
+              - name: APP_ID
+                value: ""
+              - name: TELEGRAM_BASE_URL
+                value: "http://telegram-mock:8443"
+              - name: TELEGRAM_POLL_TIMEOUT
+                value: "30s"
+            securityContext:
+              runAsUser: 0
+              runAsGroup: 0
+            ports:
+              - name: http
+                containerPort: 8080
+            volumeMounts:
+              - containerPath: /opt/app/data
+                volume:
+                  name: data
+              - containerPath: /ziti
+                volume:
+                  name: ziti
+        volumes:
+          - name: data
+            emptyDir: {}
+          - name: ziti
+            emptyDir: {}
+        service:
+          ports:
+            - name: http
+              port: 8080
+              targetPort: 8080
   telegram-mock:
     namespace: ${TELEGRAM_CONNECTOR_NAMESPACE}
     helm:
@@ -94,20 +206,41 @@ deployments:
         repo: https://charts.devspace.sh
       values:
         containers:
-          - image: ${E2E_IMAGE}
+          - name: telegram-mock
+            image: ${E2E_IMAGE}
+            workingDir: /opt/app/data
+            command:
+              - sh
+              - -c
+              - |
+                set -eu
+                elapsed=0
+                while [ ! -f /opt/app/data/go.mod ]; do
+                  sleep 1; elapsed=$((elapsed + 1))
+                  [ "$elapsed" -ge 120 ] && { echo "ERROR: sync timeout" >&2; exit 1; }
+                done
+                exec go run ./test/e2e/telegram-mock
             env:
               - name: TELEGRAM_MOCK_ADDRESS
                 value: ":8443"
+            securityContext:
+              runAsUser: 0
+              runAsGroup: 0
             ports:
               - name: http
                 containerPort: 8443
+            volumeMounts:
+              - containerPath: /opt/app/data
+                volume:
+                  name: data
+        volumes:
+          - name: data
+            emptyDir: {}
         service:
           ports:
             - name: http
               port: 8443
               targetPort: 8443
-        labels:
-          app.kubernetes.io/name: telegram-mock
   e2e-runner:
     namespace: ${TELEGRAM_CONNECTOR_NAMESPACE}
     helm:
@@ -116,7 +249,9 @@ deployments:
         repo: https://charts.devspace.sh
       values:
         containers:
-          - image: ${E2E_IMAGE}
+          - name: e2e-runner
+            image: ${E2E_IMAGE}
+            command: ["sleep", "infinity"]
             env:
               - name: TELEGRAM_CONNECTOR_ADDRESS
                 value: "telegram-connector:8080"
@@ -130,12 +265,22 @@ deployments:
                 value: "files:50051"
               - name: NOTIFICATIONS_ADDRESS
                 value: "notifications:50051"
-        labels:
-          app.kubernetes.io/name: telegram-connector-e2e
+              - name: ORGANIZATIONS_ADDRESS
+                value: "tenants:50051"
+            securityContext:
+              runAsUser: 0
+              runAsGroup: 0
+            volumeMounts:
+              - containerPath: /opt/app/data
+                volume:
+                  name: data
+        volumes:
+          - name: data
+            emptyDir: {}
 
 commands:
-  test:e2e: |-
-    devspace run-pipeline test:e2e $@
+  test-e2e: |-
+    devspace run-pipeline test-e2e $@
 
 pipelines:
   dev:
@@ -153,7 +298,7 @@ pipelines:
         echo "Waiting for telegram-connector to be healthy on :8080..."
         healthy=false
         for i in $(seq 1 60); do
-          if exec_container --label-selector=app.kubernetes.io/name=telegram-connector -n ${TELEGRAM_CONNECTOR_NAMESPACE} -- bash -c 'nc -z localhost 8080 >/dev/null 2>&1 || (echo > /dev/tcp/localhost/8080) >/dev/null 2>&1'; then
+          if exec_container --label-selector=app.kubernetes.io/component=telegram-connector -n ${TELEGRAM_CONNECTOR_NAMESPACE} -- bash -c 'nc -z localhost 8080 >/dev/null 2>&1 || (echo > /dev/tcp/localhost/8080) >/dev/null 2>&1'; then
             healthy=true
             break
           fi
@@ -167,25 +312,37 @@ pipelines:
         stop_dev telegram-connector
       fi
 
-  test:e2e:
+  test-e2e:
     run: |-
-      kubectl set env deployment telegram-connector-telegram-connector -n ${TELEGRAM_CONNECTOR_NAMESPACE} TELEGRAM_BASE_URL=http://telegram-mock:8443
-      kubectl rollout status deployment telegram-connector-telegram-connector -n ${TELEGRAM_CONNECTOR_NAMESPACE} --timeout=120s
-      create_deployments telegram-mock e2e-runner
-      start_dev telegram-mock &
-      start_dev e2e-runner &
+      create_deployments telegram-connector-db telegram-mock e2e-runner
+      start_dev --disable-pod-replace telegram-mock &
+      start_dev --disable-pod-replace e2e-runner &
       sleep 5
-      exec_container \
-        --label-selector "app.kubernetes.io/name=telegram-connector-e2e" \
+      BOOTSTRAP_ENV=$(exec_container \
+        --label-selector "app.kubernetes.io/component=e2e-runner" \
         -n ${TELEGRAM_CONNECTOR_NAMESPACE} \
-        -- bash -c 'cd /opt/app/data && buf generate --template buf.gen.e2e.yaml buf.build/agynio/api --path agynio/api/apps/v1/apps.proto --path agynio/api/files/v1/files.proto --path agynio/api/threads/v1/threads.proto --path agynio/api/notifications/v1/notifications.proto && go test -v -count=1 -tags e2e ./test/e2e/'
+        -- bash -c 'set -eu; elapsed=0; while [ ! -f /opt/app/data/go.mod ]; do sleep 1; elapsed=$((elapsed + 1)); [ "$elapsed" -ge 120 ] && { echo "ERROR: sync timeout" >&2; exit 1; }; done; cd /opt/app/data && go run -tags e2e ./test/e2e/bootstrapcmd')
+      eval "$BOOTSTRAP_ENV"
+      create_deployments telegram-connector
+      kubectl set env deployment telegram-connector -n ${TELEGRAM_CONNECTOR_NAMESPACE} \
+        APP_ID="$E2E_APP_ID" \
+        SERVICE_TOKEN="$E2E_SERVICE_TOKEN" \
+        ZITI_SERVICE_NAME="$E2E_ZITI_SERVICE_NAME" \
+        TELEGRAM_BASE_URL="http://telegram-mock:8443"
+      kubectl rollout status deployment telegram-connector -n ${TELEGRAM_CONNECTOR_NAMESPACE} --timeout=120s
+      start_dev --disable-pod-replace telegram-connector &
+      exec_container \
+        --label-selector "app.kubernetes.io/component=e2e-runner" \
+        -n ${TELEGRAM_CONNECTOR_NAMESPACE} \
+        -- bash -c "set -eu; elapsed=0; while [ ! -f /opt/app/data/go.mod ]; do sleep 1; elapsed=$((elapsed + 1)); [ \"$elapsed\" -ge 120 ] && { echo \"ERROR: sync timeout\" >&2; exit 1; }; done; cd /opt/app/data && E2E_OWNER_IDENTITY_ID=$E2E_OWNER_IDENTITY_ID E2E_AGENT_IDENTITY_ID=$E2E_AGENT_IDENTITY_ID E2E_ORGANIZATION_ID=$E2E_ORGANIZATION_ID E2E_APP_ID=$E2E_APP_ID E2E_APP_IDENTITY_ID=$E2E_APP_IDENTITY_ID E2E_CLEANUP=$E2E_CLEANUP go test -v -count=1 -tags e2e ./test/e2e/"
       EXIT_CODE=$?
+      stop_dev telegram-connector
       stop_dev telegram-mock
       stop_dev e2e-runner
+      purge_deployments telegram-connector
+      purge_deployments telegram-connector-db
       purge_deployments telegram-mock
       purge_deployments e2e-runner
-      kubectl set env deployment telegram-connector-telegram-connector -n ${TELEGRAM_CONNECTOR_NAMESPACE} TELEGRAM_BASE_URL=https://api.telegram.org
-      kubectl rollout status deployment telegram-connector-telegram-connector -n ${TELEGRAM_CONNECTOR_NAMESPACE} --timeout=120s
       exit $EXIT_CODE
 
 hooks:
@@ -201,8 +358,7 @@ dev:
   telegram-connector:
     namespace: ${TELEGRAM_CONNECTOR_NAMESPACE}
     labelSelector:
-      app.kubernetes.io/name: telegram-connector
-      app.kubernetes.io/instance: telegram-connector
+      app.kubernetes.io/component: telegram-connector
     containers:
       telegram-connector:
         container: telegram-connector
@@ -211,17 +367,16 @@ dev:
             excludePaths:
               - .git/
               - .devspace/
-              - /.gen/
               - /tmp/
             uploadExcludePaths:
               - .git/
               - .devspace/
-              - /.gen/
+              - /codex-tools-mcp
               - /tmp/
             downloadExcludePaths:
               - .git/
               - .devspace/
-              - /.gen/
+              - /codex-tools-mcp
               - /tmp/
         logs:
           enabled: true
@@ -232,7 +387,7 @@ dev:
   telegram-mock:
     namespace: ${TELEGRAM_CONNECTOR_NAMESPACE}
     labelSelector:
-      app.kubernetes.io/name: telegram-mock
+      app.kubernetes.io/component: telegram-mock
     command:
       - sh
       - -c
@@ -250,13 +405,13 @@ dev:
         excludePaths:
           - .git/
           - .devspace/
-          - /.gen/
+          - /codex-tools-mcp
           - /tmp/
 
   e2e-runner:
     namespace: ${TELEGRAM_CONNECTOR_NAMESPACE}
     labelSelector:
-      app.kubernetes.io/name: telegram-connector-e2e
+      app.kubernetes.io/component: e2e-runner
     command: ["sleep", "infinity"]
     workingDir: /opt/app/data
     sync:
@@ -264,5 +419,5 @@ dev:
         excludePaths:
           - .git/
           - .devspace/
-          - /.gen/
+          - /codex-tools-mcp
           - /tmp/

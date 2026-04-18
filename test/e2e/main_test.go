@@ -18,41 +18,66 @@ import (
 	appsv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/apps/v1"
 	filesv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/files/v1"
 	notificationsv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/notifications/v1"
+	organizationsv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/organizations/v1"
 	threadsv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/threads/v1"
+	"github.com/agynio/telegram-connector/test/e2e/bootstrap"
 )
 
 var (
 	connectorAddress     string
 	telegramMockAddress  string
 	appsAddress          string
+	organizationsAddress string
 	threadsAddress       string
 	filesAddress         string
 	notificationsAddress string
 
 	httpClient          *http.Client
 	appsClient          appsv1.AppsServiceClient
+	organizationsClient organizationsv1.OrganizationsServiceClient
 	threadsClient       threadsv1.ThreadsServiceClient
 	filesClient         filesv1.FilesServiceClient
 	notificationsClient notificationsv1.NotificationsServiceClient
 
-	organizationID  string
-	agentIdentityID string
-	appID           string
-	appIdentityID   string
-	botToken        string
-	installationID  string
+	organizationID   string
+	ownerIdentityID  string
+	agentIdentityID  string
+	appID            string
+	appIdentityID    string
+	botToken         string
+	installationID   string
+	cleanupResources bool
 )
 
 func TestMain(m *testing.M) {
 	connectorAddress = envOrDefault("TELEGRAM_CONNECTOR_ADDRESS", "telegram-connector:8080")
 	telegramMockAddress = envOrDefault("TELEGRAM_MOCK_ADDRESS", "telegram-mock:8443")
 	appsAddress = envOrDefault("APPS_ADDRESS", "apps:50051")
+	organizationsAddress = envOrDefault("ORGANIZATIONS_ADDRESS", "tenants:50051")
 	threadsAddress = envOrDefault("THREADS_ADDRESS", "threads:50051")
 	filesAddress = envOrDefault("FILES_ADDRESS", "files:50051")
 	notificationsAddress = envOrDefault("NOTIFICATIONS_ADDRESS", "notifications:50051")
 
-	organizationID = requireEnv("TEST_ORGANIZATION_ID")
-	agentIdentityID = requireEnv("TEST_AGENT_IDENTITY_ID")
+	organizationID = os.Getenv("E2E_ORGANIZATION_ID")
+	appID = os.Getenv("E2E_APP_ID")
+	appIdentityID = os.Getenv("E2E_APP_IDENTITY_ID")
+	ownerIdentityID = os.Getenv("E2E_OWNER_IDENTITY_ID")
+	agentIdentityID = os.Getenv("E2E_AGENT_IDENTITY_ID")
+	cleanupResources = os.Getenv("E2E_CLEANUP") == "true"
+
+	hasBootstrapEnv := organizationID != "" || appID != "" || appIdentityID != "" || ownerIdentityID != ""
+	if hasBootstrapEnv {
+		if organizationID == "" || appID == "" || appIdentityID == "" || ownerIdentityID == "" {
+			fmt.Fprintln(os.Stderr, "e2e setup: E2E_* env incomplete (need ORG, APP, APP_IDENTITY, OWNER)")
+			os.Exit(1)
+		}
+		if agentIdentityID == "" {
+			agentIdentityID = ownerIdentityID
+		}
+	} else {
+		ownerIdentityID = uuid.NewString()
+		agentIdentityID = ownerIdentityID
+	}
 
 	httpClient = &http.Client{Timeout: 10 * time.Second}
 
@@ -79,25 +104,30 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "e2e setup: dial notifications: %v\n", err)
 		os.Exit(1)
 	}
+	organizationsConn, err := grpc.NewClient(organizationsAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "e2e setup: dial organizations: %v\n", err)
+		os.Exit(1)
+	}
 
 	appsClient = appsv1.NewAppsServiceClient(appsConn)
+	organizationsClient = organizationsv1.NewOrganizationsServiceClient(organizationsConn)
 	threadsClient = threadsv1.NewThreadsServiceClient(threadsConn)
 	filesClient = filesv1.NewFilesServiceClient(filesConn)
 	notificationsClient = notificationsv1.NewNotificationsServiceClient(notificationsConn)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	appSlug := envOrDefault("TELEGRAM_APP_SLUG", "telegram")
-	app, err := resolveApp(ctx, appSlug)
-	cancel()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "e2e setup: resolve app: %v\n", err)
-		os.Exit(1)
-	}
-	appID = app.GetMeta().GetId()
-	appIdentityID = app.GetIdentityId()
-	if appID == "" || appIdentityID == "" {
-		fmt.Fprintf(os.Stderr, "e2e setup: app has missing id or identity_id\n")
-		os.Exit(1)
+	if !hasBootstrapEnv {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		result, err := bootstrap.Create(ctx, organizationsClient, appsClient, ownerIdentityID)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "e2e setup: bootstrap: %v\n", err)
+			os.Exit(1)
+		}
+		organizationID = result.OrganizationID
+		appID = result.AppID
+		appIdentityID = result.AppIdentityID
+		cleanupResources = true
 	}
 
 	botToken = "e2e-" + uuid.NewString()
@@ -109,8 +139,8 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "e2e setup: build installation config: %v\n", err)
 		os.Exit(1)
 	}
-	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-	installResp, err := appsClient.InstallApp(ctx, &appsv1.InstallAppRequest{
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	installResp, err := appsClient.InstallApp(bootstrap.IdentityContext(ctx, ownerIdentityID), &appsv1.InstallAppRequest{
 		AppId:          appID,
 		OrganizationId: organizationID,
 		Configuration:  config,
@@ -133,10 +163,25 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
-	_, err = appsClient.UninstallApp(ctx, &appsv1.UninstallAppRequest{Id: installationID})
+	_, err = appsClient.UninstallApp(bootstrap.IdentityContext(ctx, ownerIdentityID), &appsv1.UninstallAppRequest{Id: installationID})
 	cancel()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "e2e cleanup: uninstall app: %v\n", err)
+	}
+	if cleanupResources {
+		ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
+		_, err = appsClient.DeleteApp(bootstrap.IdentityContext(ctx, ownerIdentityID), &appsv1.DeleteAppRequest{Id: appID})
+		cancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "e2e cleanup: delete app: %v\n", err)
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
+		_, err = organizationsClient.DeleteOrganization(bootstrap.IdentityContext(ctx, ownerIdentityID), &organizationsv1.DeleteOrganizationRequest{Id: organizationID})
+		cancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "e2e cleanup: delete organization: %v\n", err)
+		}
 	}
 
 	if err := appsConn.Close(); err != nil {
@@ -150,6 +195,9 @@ func TestMain(m *testing.M) {
 	}
 	if err := notificationsConn.Close(); err != nil {
 		fmt.Fprintf(os.Stderr, "e2e cleanup: close notifications conn: %v\n", err)
+	}
+	if err := organizationsConn.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "e2e cleanup: close organizations conn: %v\n", err)
 	}
 
 	os.Exit(code)
