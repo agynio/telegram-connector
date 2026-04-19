@@ -47,8 +47,8 @@ WORKDIR /app
 
 COPY --from=build /out/telegram-connector /app/telegram-connector
 
-RUN addgroup -S app && adduser -S app -G app
+RUN addgroup -S -g 10001 app && adduser -S -D -H -u 10001 -G app app
 
-USER app
+USER 10001
 
 ENTRYPOINT ["/app/telegram-connector"]
