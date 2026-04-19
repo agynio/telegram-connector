@@ -2,8 +2,8 @@ apiVersion: v2
 name: telegram-connector
 description: Helm chart for deploying the Telegram Connector service.
 type: application
-version: 0.1.0
-appVersion: 0.1.0
+version: 0.1.1
+appVersion: 0.1.1
 home: https://github.com/agynio/telegram-connector
 sources:
   - https://github.com/agynio/telegram-connector
