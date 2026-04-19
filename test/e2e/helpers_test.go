@@ -86,14 +86,28 @@ func envOrDefault(key, fallback string) string {
 
 func waitForHealthy(url string, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
+	client := httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(url)
+		attemptTimeout := 5 * time.Second
+		if remaining := time.Until(deadline); remaining < attemptTimeout {
+			attemptTimeout = remaining
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return
+			resp, err := client.Do(req)
+			if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					cancel()
+					return
+				}
 			}
 		}
+		cancel()
 		time.Sleep(time.Second)
 	}
 	fmt.Fprintf(os.Stderr, "e2e setup: %s not healthy within %s\n", url, timeout)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -17,7 +18,10 @@ import (
 	"github.com/agynio/telegram-connector/internal/telegram"
 )
 
-const defaultAddress = ":8443"
+const (
+	defaultAddress         = ":8443"
+	getUpdatesPollInterval = 200 * time.Millisecond
+)
 
 type server struct {
 	mu     sync.Mutex
@@ -269,14 +273,52 @@ func (s *server) handleGetUpdates(w http.ResponseWriter, r *http.Request, token 
 		return
 	}
 	var req struct {
-		Offset int64 `json:"offset"`
+		Offset  int64 `json:"offset"`
+		Timeout int   `json:"timeout"`
+		Limit   int   `json:"limit"`
 	}
 	if err := decodeJSON(r.Body, &req); err != nil {
 		writeTelegramError(w, http.StatusBadRequest, http.StatusBadRequest, err.Error(), 0)
 		return
 	}
-	updates := s.consumeUpdates(token, req.Offset)
+	if req.Timeout < 0 {
+		req.Timeout = 0
+	}
+	if req.Limit < 0 {
+		req.Limit = 0
+	}
+	updates := s.waitForUpdates(r.Context(), token, req.Offset, req.Limit, time.Duration(req.Timeout)*time.Second)
+	if r.Context().Err() != nil {
+		return
+	}
 	writeTelegramOK(w, updates)
+}
+
+func (s *server) waitForUpdates(ctx context.Context, token string, offset int64, limit int, timeout time.Duration) []telegram.Update {
+	if timeout <= 0 {
+		return s.consumeUpdates(token, offset, limit)
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		updates := s.consumeUpdates(token, offset, limit)
+		if len(updates) > 0 {
+			return updates
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		wait := getUpdatesPollInterval
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
 }
 
 func (s *server) handleGetFile(w http.ResponseWriter, r *http.Request, token string) {
@@ -433,17 +475,24 @@ func (s *server) enqueueSendError(token string, err sendError) {
 	state.sendErrors = append(state.sendErrors, err)
 }
 
-func (s *server) consumeUpdates(token string, offset int64) []telegram.Update {
+func (s *server) consumeUpdates(token string, offset int64, limit int) []telegram.Update {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state := s.ensureToken(token)
-	updates := make([]telegram.Update, 0, len(state.updates))
-	for _, update := range state.updates {
-		if offset == 0 || update.UpdateID >= offset {
-			updates = append(updates, update)
+	if offset > 0 {
+		filtered := make([]telegram.Update, 0, len(state.updates))
+		for _, update := range state.updates {
+			if update.UpdateID >= offset {
+				filtered = append(filtered, update)
+			}
 		}
+		state.updates = filtered
 	}
-	state.updates = nil
+	if limit <= 0 || limit > len(state.updates) {
+		limit = len(state.updates)
+	}
+	updates := make([]telegram.Update, limit)
+	copy(updates, state.updates[:limit])
 	return updates
 }
 

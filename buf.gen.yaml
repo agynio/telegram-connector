@@ -25,6 +25,7 @@ inputs:
   - module: buf.build/agynio/api
     paths:
       - agynio/api/apps/v1/apps.proto
+      - agynio/api/organizations/v1/organizations.proto
       - agynio/api/files/v1/files.proto
       - agynio/api/threads/v1/threads.proto
       - agynio/api/notifications/v1/notifications.proto

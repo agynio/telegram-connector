@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openziti/sdk-golang/ziti"
 
@@ -23,7 +25,13 @@ import (
 	"github.com/agynio/telegram-connector/internal/store"
 )
 
-const shutdownTimeout = 10 * time.Second
+const (
+	shutdownTimeout       = 10 * time.Second
+	startupTimeout        = 90 * time.Second
+	zitiListenRetryDelay  = 2 * time.Second
+	gatewayRetryDelay     = 2 * time.Second
+	gatewayAttemptTimeout = 10 * time.Second
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -70,6 +78,8 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create ziti context: %w", err)
 	}
+	startupCtx, cancel := context.WithTimeout(ctx, startupTimeout)
+	defer cancel()
 
 	store := store.NewStore(pool)
 	gatewayClient := gateway.NewClient(
@@ -77,6 +87,9 @@ func run() error {
 		fmt.Sprintf("http://%s", cfg.GatewayServiceName),
 		enrolled.IdentityID,
 	)
+	if err := waitForGatewayReady(startupCtx, gatewayClient, cfg.AppID); err != nil {
+		return fmt.Errorf("wait for gateway: %w", err)
+	}
 
 	service := connector.NewService(store, gatewayClient, connector.ServiceConfig{
 		AppID:           cfg.AppID,
@@ -96,7 +109,7 @@ func run() error {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	zitiListener, err := zitiCtx.ListenWithOptions(cfg.ZitiServiceName, &ziti.ListenOptions{})
+	zitiListener, err := listenZitiWithRetry(startupCtx, zitiCtx, cfg.ZitiServiceName)
 	if err != nil {
 		return fmt.Errorf("listen on ziti service %s: %w", cfg.ZitiServiceName, err)
 	}
@@ -146,4 +159,66 @@ func run() error {
 		return shutdownErr
 	}
 	return serveErr
+}
+
+func listenZitiWithRetry(ctx context.Context, zitiCtx ziti.Context, serviceName string) (net.Listener, error) {
+	for {
+		listener, err := zitiCtx.ListenWithOptions(serviceName, &ziti.ListenOptions{})
+		if err == nil {
+			return listener, nil
+		}
+		if !isIdentityMissingError(err) {
+			return nil, err
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		log.Printf("ziti listener not ready, retrying: %v", err)
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(zitiListenRetryDelay):
+		}
+	}
+}
+
+func waitForGatewayReady(ctx context.Context, client *gateway.Client, appID string) error {
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, gatewayAttemptTimeout)
+		_, err := client.ListInstallations(attemptCtx, appID)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if !isGatewayRetryableError(err) {
+			return err
+		}
+		if ctx.Err() != nil {
+			return err
+		}
+		log.Printf("gateway not ready, retrying: %v", err)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(gatewayRetryDelay):
+		}
+	}
+}
+
+func isGatewayRetryableError(err error) bool {
+	if isIdentityMissingError(err) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var connectErr *connect.Error
+	if errors.As(err, &connectErr) {
+		return connectErr.Code() == connect.CodeUnavailable
+	}
+	return false
+}
+
+func isIdentityMissingError(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "identity not found")
 }
