@@ -6,21 +6,20 @@ import (
 	"sync"
 	"time"
 
-	"github.com/agynio/telegram-connector/internal/gateway"
 	"github.com/agynio/telegram-connector/internal/telegram"
 )
 
 type installationWorker struct {
 	installation   Installation
 	store          Store
-	gateway        *gateway.Client
+	gateway        Gateway
 	telegramClient *telegram.Client
 	pollTimeout    time.Duration
 	cancel         context.CancelFunc
 	done           chan struct{}
 }
 
-func newInstallationWorker(installation Installation, store Store, gatewayClient *gateway.Client, telegramBaseURL string, pollTimeout time.Duration) *installationWorker {
+func newInstallationWorker(installation Installation, store Store, gatewayClient Gateway, telegramBaseURL string, pollTimeout time.Duration) *installationWorker {
 	return &installationWorker{
 		installation:   installation,
 		store:          store,
