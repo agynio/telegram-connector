@@ -7,10 +7,13 @@ import (
 	"sync"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/google/uuid"
 
 	appsv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/apps/v1"
-	"github.com/agynio/telegram-connector/internal/gateway"
+	filesv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/files/v1"
+	notificationsv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/notifications/v1"
+	threadsv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/threads/v1"
 	"github.com/agynio/telegram-connector/internal/store"
 )
 
@@ -20,15 +23,30 @@ type Store interface {
 	GetChatMapping(ctx context.Context, installationID uuid.UUID, chatID int64) (store.ChatMapping, bool, error)
 	GetChatMappingByThreadID(ctx context.Context, installationID, threadID uuid.UUID) (store.ChatMapping, bool, error)
 	CreateChatMapping(ctx context.Context, input store.ChatMappingInput) (store.ChatMapping, error)
+	DeleteChatMapping(ctx context.Context, installationID uuid.UUID, chatID int64) error
 	ClearChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) error
 	MarkChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) error
 	GetInstallationState(ctx context.Context, installationID uuid.UUID) (int64, error)
 	UpsertInstallationState(ctx context.Context, installationID uuid.UUID, lastUpdateID int64) error
 }
 
+type Gateway interface {
+	AppIdentityID() string
+	ListInstallations(ctx context.Context, appID string) ([]*appsv1.Installation, error)
+	CreateThread(ctx context.Context, organizationID string) (*threadsv1.Thread, error)
+	AddParticipant(ctx context.Context, organizationID, threadID, participantID string) error
+	SendMessage(ctx context.Context, threadID, body string, fileIDs []string) error
+	GetUnackedMessages(ctx context.Context) ([]*threadsv1.Message, error)
+	AckMessages(ctx context.Context, messageIDs []string) error
+	Subscribe(ctx context.Context) (*connect.ServerStreamForClient[notificationsv1.SubscribeResponse], error)
+	UploadFile(ctx context.Context, metadata *filesv1.UploadFileMetadata, payload []byte) (*filesv1.FileInfo, error)
+	GetFileMetadata(ctx context.Context, fileID string) (*filesv1.FileInfo, error)
+	GetFileContent(ctx context.Context, fileID string) ([]byte, error)
+}
+
 type Service struct {
 	store           Store
-	gateway         *gateway.Client
+	gateway         Gateway
 	appID           string
 	telegramBaseURL string
 	pollTimeout     time.Duration
@@ -47,7 +65,7 @@ type ServiceConfig struct {
 	PollTimeout     time.Duration
 }
 
-func NewService(store Store, gatewayClient *gateway.Client, cfg ServiceConfig) *Service {
+func NewService(store Store, gatewayClient Gateway, cfg ServiceConfig) *Service {
 	return &Service{
 		store:           store,
 		gateway:         gatewayClient,
@@ -135,14 +153,14 @@ func (s *Service) parseInstallation(ctx context.Context, installation *appsv1.In
 
 type installationManager struct {
 	store           Store
-	gateway         *gateway.Client
+	gateway         Gateway
 	telegramBaseURL string
 	pollTimeout     time.Duration
 	mu              sync.Mutex
 	workers         map[uuid.UUID]*installationWorker
 }
 
-func newInstallationManager(store Store, gatewayClient *gateway.Client, telegramBaseURL string, pollTimeout time.Duration) *installationManager {
+func newInstallationManager(store Store, gatewayClient Gateway, telegramBaseURL string, pollTimeout time.Duration) *installationManager {
 	return &installationManager{
 		store:           store,
 		gateway:         gatewayClient,

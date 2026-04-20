@@ -2,11 +2,13 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/google/uuid"
 
 	filesv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/files/v1"
@@ -14,7 +16,10 @@ import (
 	"github.com/agynio/telegram-connector/internal/telegram"
 )
 
-const inboundRetryDelay = time.Second
+const (
+	inboundRetryDelay     = time.Second
+	degradedThreadMessage = "thread is degraded"
+)
 
 func (w *installationWorker) runInbound(ctx context.Context) error {
 	lastUpdateID, err := w.loadInstallationState(ctx)
@@ -117,40 +122,69 @@ func (w *installationWorker) handleUpdate(ctx context.Context, update telegram.U
 			return err
 		}
 	}
-
-	threadID := mapping.ThreadID
 	if !found {
-		thread, err := w.gateway.CreateThread(ctx, w.installation.OrganizationID.String())
+		var err error
+		mapping, err = w.createThreadMapping(ctx, message.Chat.ID, message.From.ID)
 		if err != nil {
 			return err
 		}
-		threadUUID, err := uuid.Parse(thread.GetId())
-		if err != nil {
-			return fmt.Errorf("invalid thread id: %w", err)
-		}
-		if err := w.gateway.AddParticipant(ctx, w.installation.OrganizationID.String(), thread.GetId(), w.installation.AgentID.String()); err != nil {
-			return err
-		}
-		mapping, err = w.store.CreateChatMapping(ctx, store.ChatMappingInput{
-			InstallationID: w.installation.ID,
-			TelegramChatID: message.Chat.ID,
-			TelegramUserID: message.From.ID,
-			ThreadID:       threadUUID,
-		})
-		if err != nil {
-			return err
-		}
-		threadID = mapping.ThreadID
 	}
 
 	body, fileIDs, err := w.buildInboundMessage(ctx, message)
 	if err != nil {
 		return err
 	}
+	threadID := mapping.ThreadID
 	if err := w.gateway.SendMessage(ctx, threadID.String(), body, fileIDs); err != nil {
-		return err
+		if !isThreadDegradedError(err) {
+			return err
+		}
+		log.Printf("connector: thread %s degraded for chat %d", threadID.String(), message.Chat.ID)
+		mapping, err = w.remapThreadMapping(ctx, message)
+		if err != nil {
+			return err
+		}
+		threadID = mapping.ThreadID
+		if err := w.gateway.SendMessage(ctx, threadID.String(), body, fileIDs); err != nil {
+			if isThreadDegradedError(err) {
+				log.Printf("connector: remapped thread %s degraded for chat %d", threadID.String(), message.Chat.ID)
+				return nil
+			}
+			return err
+		}
 	}
 	return nil
+}
+
+func (w *installationWorker) createThreadMapping(ctx context.Context, chatID, userID int64) (store.ChatMapping, error) {
+	thread, err := w.gateway.CreateThread(ctx, w.installation.OrganizationID.String())
+	if err != nil {
+		return store.ChatMapping{}, err
+	}
+	threadUUID, err := uuid.Parse(thread.GetId())
+	if err != nil {
+		return store.ChatMapping{}, fmt.Errorf("invalid thread id: %w", err)
+	}
+	if err := w.gateway.AddParticipant(ctx, w.installation.OrganizationID.String(), thread.GetId(), w.installation.AgentID.String()); err != nil {
+		return store.ChatMapping{}, err
+	}
+	mapping, err := w.store.CreateChatMapping(ctx, store.ChatMappingInput{
+		InstallationID: w.installation.ID,
+		TelegramChatID: chatID,
+		TelegramUserID: userID,
+		ThreadID:       threadUUID,
+	})
+	if err != nil {
+		return store.ChatMapping{}, err
+	}
+	return mapping, nil
+}
+
+func (w *installationWorker) remapThreadMapping(ctx context.Context, message *telegram.Message) (store.ChatMapping, error) {
+	if err := w.store.DeleteChatMapping(ctx, w.installation.ID, message.Chat.ID); err != nil {
+		return store.ChatMapping{}, err
+	}
+	return w.createThreadMapping(ctx, message.Chat.ID, message.From.ID)
 }
 
 func (w *installationWorker) buildInboundMessage(ctx context.Context, message *telegram.Message) (string, []string, error) {
@@ -233,6 +267,14 @@ func (w *installationWorker) uploadTelegramFile(ctx context.Context, fileID, fil
 		return "", err
 	}
 	return uploaded.GetId(), nil
+}
+
+func isThreadDegradedError(err error) bool {
+	var connectErr *connect.Error
+	if errors.As(err, &connectErr) {
+		return connectErr.Code() == connect.CodeFailedPrecondition && connectErr.Message() == degradedThreadMessage
+	}
+	return false
 }
 
 func largestPhoto(photos []telegram.Photo) telegram.Photo {

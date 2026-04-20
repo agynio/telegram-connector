@@ -86,6 +86,16 @@ func (s *Store) CreateChatMapping(ctx context.Context, input ChatMappingInput) (
 	return mapping, nil
 }
 
+func (s *Store) DeleteChatMapping(ctx context.Context, installationID uuid.UUID, chatID int64) error {
+	if _, err := s.pool.Exec(ctx, `
+        DELETE FROM chat_mappings
+        WHERE installation_id = $1 AND telegram_chat_id = $2
+    `, installationID, chatID); err != nil {
+		return fmt.Errorf("delete chat mapping: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) ClearChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) error {
 	if _, err := s.pool.Exec(ctx, `
         UPDATE chat_mappings
