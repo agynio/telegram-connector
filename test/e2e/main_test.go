@@ -31,6 +31,7 @@ var (
 	threadsAddress       string
 	filesAddress         string
 	notificationsAddress string
+	localEnv             *localEnvironment
 
 	httpClient          *http.Client
 	appsClient          appsv1.AppsServiceClient
@@ -50,13 +51,30 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	connectorAddress = envOrDefault("TELEGRAM_CONNECTOR_ADDRESS", "telegram-connector:8080")
-	telegramMockAddress = envOrDefault("TELEGRAM_MOCK_ADDRESS", "telegram-mock:8443")
-	appsAddress = envOrDefault("APPS_ADDRESS", "apps:50051")
-	organizationsAddress = envOrDefault("ORGANIZATIONS_ADDRESS", "tenants:50051")
-	threadsAddress = envOrDefault("THREADS_ADDRESS", "threads:50051")
-	filesAddress = envOrDefault("FILES_ADDRESS", "files:50051")
-	notificationsAddress = envOrDefault("NOTIFICATIONS_ADDRESS", "notifications:50051")
+	useExternal := os.Getenv("E2E_EXTERNAL") == "true"
+	if useExternal {
+		connectorAddress = envOrDefault("TELEGRAM_CONNECTOR_ADDRESS", "telegram-connector:8080")
+		telegramMockAddress = envOrDefault("TELEGRAM_MOCK_ADDRESS", "telegram-mock:8443")
+		appsAddress = envOrDefault("APPS_ADDRESS", "apps:50051")
+		organizationsAddress = envOrDefault("ORGANIZATIONS_ADDRESS", "tenants:50051")
+		threadsAddress = envOrDefault("THREADS_ADDRESS", "threads:50051")
+		filesAddress = envOrDefault("FILES_ADDRESS", "files:50051")
+		notificationsAddress = envOrDefault("NOTIFICATIONS_ADDRESS", "notifications:50051")
+	} else {
+		env, err := startLocalEnvironment()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "e2e setup: local env: %v\n", err)
+			os.Exit(1)
+		}
+		localEnv = env
+		connectorAddress = env.connectorAddr
+		telegramMockAddress = env.telegramAddr
+		appsAddress = env.appsAddr
+		organizationsAddress = env.organizationsAddr
+		threadsAddress = env.threadsAddr
+		filesAddress = env.filesAddr
+		notificationsAddress = env.notificationsAddr
+	}
 
 	organizationID = os.Getenv("E2E_ORGANIZATION_ID")
 	appID = os.Getenv("E2E_APP_ID")
@@ -159,6 +177,9 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "e2e setup: reset telegram mock: %v\n", err)
 		os.Exit(1)
 	}
+	if localEnv != nil {
+		localEnv.StartConnector(appID, appIdentityID)
+	}
 
 	code := m.Run()
 
@@ -198,6 +219,9 @@ func TestMain(m *testing.M) {
 	}
 	if err := organizationsConn.Close(); err != nil {
 		fmt.Fprintf(os.Stderr, "e2e cleanup: close organizations conn: %v\n", err)
+	}
+	if localEnv != nil {
+		localEnv.Shutdown()
 	}
 
 	os.Exit(code)

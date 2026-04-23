@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +25,8 @@ type stubGateway struct {
 	createThreadFn   func(context.Context, string) (*threadsv1.Thread, error)
 	addParticipantFn func(context.Context, string, string, string) error
 	sendMessageFn    func(context.Context, string, string, []string) error
+	reportStatusFn   func(context.Context, string, string) error
+	appendAuditFn    func(context.Context, string, string, appsv1.InstallationAuditLogLevel, string) error
 }
 
 func (s *stubGateway) AppIdentityID() string {
@@ -86,14 +89,30 @@ func (s *stubGateway) GetFileContent(ctx context.Context, fileID string) ([]byte
 	return nil, nil
 }
 
+func (s *stubGateway) ReportInstallationStatus(ctx context.Context, installationID, status string) error {
+	if s.reportStatusFn == nil {
+		s.t.Fatalf("unexpected ReportInstallationStatus")
+	}
+	return s.reportStatusFn(ctx, installationID, status)
+}
+
+func (s *stubGateway) AppendInstallationAuditLogEntry(ctx context.Context, installationID, message string, level appsv1.InstallationAuditLogLevel, idempotencyKey string) error {
+	if s.appendAuditFn == nil {
+		s.t.Fatalf("unexpected AppendInstallationAuditLogEntry")
+	}
+	return s.appendAuditFn(ctx, installationID, message, level, idempotencyKey)
+}
+
 type stubStore struct {
 	t                      *testing.T
 	getChatMappingFn       func(context.Context, uuid.UUID, int64) (store.ChatMapping, bool, error)
 	createChatMappingFn    func(context.Context, store.ChatMappingInput) (store.ChatMapping, error)
 	deleteChatMappingFn    func(context.Context, uuid.UUID, int64) error
-	clearChatBlockedFn     func(context.Context, uuid.UUID, int64) error
-	markChatBlockedFn      func(context.Context, uuid.UUID, int64) error
-	getInstallationStateFn func(context.Context, uuid.UUID) (int64, error)
+	clearChatBlockedFn     func(context.Context, uuid.UUID, int64) (bool, error)
+	markChatBlockedFn      func(context.Context, uuid.UUID, int64) (bool, error)
+	countActiveChatsFn     func(context.Context, uuid.UUID) (int64, error)
+	countBlockedChatsFn    func(context.Context, uuid.UUID) (int64, error)
+	getInstallationStateFn func(context.Context, uuid.UUID) (store.InstallationState, error)
 	upsertStateFn          func(context.Context, uuid.UUID, int64) error
 }
 
@@ -123,21 +142,35 @@ func (s *stubStore) DeleteChatMapping(ctx context.Context, installationID uuid.U
 	return s.deleteChatMappingFn(ctx, installationID, chatID)
 }
 
-func (s *stubStore) ClearChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) error {
+func (s *stubStore) ClearChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) (bool, error) {
 	if s.clearChatBlockedFn == nil {
 		s.t.Fatalf("unexpected ClearChatBlocked")
 	}
 	return s.clearChatBlockedFn(ctx, installationID, chatID)
 }
 
-func (s *stubStore) MarkChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) error {
+func (s *stubStore) MarkChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) (bool, error) {
 	if s.markChatBlockedFn == nil {
 		s.t.Fatalf("unexpected MarkChatBlocked")
 	}
 	return s.markChatBlockedFn(ctx, installationID, chatID)
 }
 
-func (s *stubStore) GetInstallationState(ctx context.Context, installationID uuid.UUID) (int64, error) {
+func (s *stubStore) CountActiveChats(ctx context.Context, installationID uuid.UUID) (int64, error) {
+	if s.countActiveChatsFn == nil {
+		s.t.Fatalf("unexpected CountActiveChats")
+	}
+	return s.countActiveChatsFn(ctx, installationID)
+}
+
+func (s *stubStore) CountBlockedChats(ctx context.Context, installationID uuid.UUID) (int64, error) {
+	if s.countBlockedChatsFn == nil {
+		s.t.Fatalf("unexpected CountBlockedChats")
+	}
+	return s.countBlockedChatsFn(ctx, installationID)
+}
+
+func (s *stubStore) GetInstallationState(ctx context.Context, installationID uuid.UUID) (store.InstallationState, error) {
 	if s.getInstallationStateFn == nil {
 		s.t.Fatalf("unexpected GetInstallationState")
 	}
@@ -177,6 +210,7 @@ func TestHandleUpdateRemapsOnDegradedThread(t *testing.T) {
 	sendCalls := make([]string, 0, 2)
 	addParticipantCalled := false
 	createThreadCalled := false
+	auditCalls := 0
 
 	storeStub := &stubStore{
 		t: t,
@@ -226,17 +260,17 @@ func TestHandleUpdateRemapsOnDegradedThread(t *testing.T) {
 				CreatedAt:      time.Now().UTC(),
 			}, nil
 		},
-		clearChatBlockedFn: func(context.Context, uuid.UUID, int64) error {
+		clearChatBlockedFn: func(context.Context, uuid.UUID, int64) (bool, error) {
 			t.Fatal("unexpected ClearChatBlocked")
-			return nil
+			return false, nil
 		},
-		markChatBlockedFn: func(context.Context, uuid.UUID, int64) error {
+		markChatBlockedFn: func(context.Context, uuid.UUID, int64) (bool, error) {
 			t.Fatal("unexpected MarkChatBlocked")
-			return nil
+			return false, nil
 		},
-		getInstallationStateFn: func(context.Context, uuid.UUID) (int64, error) {
+		getInstallationStateFn: func(context.Context, uuid.UUID) (store.InstallationState, error) {
 			t.Fatal("unexpected GetInstallationState")
-			return 0, nil
+			return store.InstallationState{}, nil
 		},
 		upsertStateFn: func(context.Context, uuid.UUID, int64) error {
 			t.Fatal("unexpected UpsertInstallationState")
@@ -276,6 +310,25 @@ func TestHandleUpdateRemapsOnDegradedThread(t *testing.T) {
 			}
 			return fmt.Errorf("unexpected thread %s", threadArg)
 		},
+		appendAuditFn: func(_ context.Context, installationArg, message string, level appsv1.InstallationAuditLogLevel, idempotencyKey string) error {
+			auditCalls++
+			if installationArg != installationID.String() {
+				t.Fatalf("expected installation %s, got %s", installationID, installationArg)
+			}
+			if level != appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_WARNING {
+				t.Fatalf("expected warning level, got %v", level)
+			}
+			if !strings.Contains(message, auditEventThreadDegraded) {
+				t.Fatalf("expected audit message to include %s, got %s", auditEventThreadDegraded, message)
+			}
+			if !strings.Contains(message, oldThreadID.String()) || !strings.Contains(message, newThreadID.String()) {
+				t.Fatalf("expected audit message to include thread ids, got %s", message)
+			}
+			if strings.TrimSpace(idempotencyKey) == "" {
+				t.Fatal("expected idempotency key")
+			}
+			return nil
+		},
 	}
 
 	worker := newInstallationWorker(Installation{
@@ -312,6 +365,9 @@ func TestHandleUpdateRemapsOnDegradedThread(t *testing.T) {
 	if sendCalls[0] != oldThreadID.String() || sendCalls[1] != newThreadID.String() {
 		t.Fatalf("expected send to old then new thread, got %v", sendCalls)
 	}
+	if auditCalls != 1 {
+		t.Fatalf("expected 1 audit call, got %d", auditCalls)
+	}
 }
 
 func TestHandleUpdateStopsAfterSecondDegradedSend(t *testing.T) {
@@ -340,16 +396,16 @@ func TestHandleUpdateStopsAfterSecondDegradedSend(t *testing.T) {
 		createChatMappingFn: func(context.Context, store.ChatMappingInput) (store.ChatMapping, error) {
 			return store.ChatMapping{ThreadID: newThreadID}, nil
 		},
-		clearChatBlockedFn: func(context.Context, uuid.UUID, int64) error {
-			return nil
+		clearChatBlockedFn: func(context.Context, uuid.UUID, int64) (bool, error) {
+			return false, nil
 		},
-		markChatBlockedFn: func(context.Context, uuid.UUID, int64) error {
+		markChatBlockedFn: func(context.Context, uuid.UUID, int64) (bool, error) {
 			t.Fatal("unexpected MarkChatBlocked")
-			return nil
+			return false, nil
 		},
-		getInstallationStateFn: func(context.Context, uuid.UUID) (int64, error) {
+		getInstallationStateFn: func(context.Context, uuid.UUID) (store.InstallationState, error) {
 			t.Fatal("unexpected GetInstallationState")
-			return 0, nil
+			return store.InstallationState{}, nil
 		},
 		upsertStateFn: func(context.Context, uuid.UUID, int64) error {
 			t.Fatal("unexpected UpsertInstallationState")
@@ -367,6 +423,9 @@ func TestHandleUpdateStopsAfterSecondDegradedSend(t *testing.T) {
 		},
 		sendMessageFn: func(context.Context, string, string, []string) error {
 			return degradedErr
+		},
+		appendAuditFn: func(context.Context, string, string, appsv1.InstallationAuditLogLevel, string) error {
+			return nil
 		},
 	}
 
