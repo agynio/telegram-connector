@@ -31,6 +31,7 @@ const (
 	auditEventOutboundFailed       = "outbound_delivery_failed"
 	auditEventBotBlocked           = "bot_blocked_by_user"
 	auditEventBotUnblocked         = "bot_unblocked_by_user"
+	auditEventAttachmentSkipped    = "attachment_skipped"
 )
 
 type auditEvent struct {
