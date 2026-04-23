@@ -446,3 +446,83 @@ func TestHandleUpdateStopsAfterSecondDegradedSend(t *testing.T) {
 		t.Fatalf("handleUpdate returned error: %v", err)
 	}
 }
+
+func TestHandleUpdateSkipsEmptyMessageAfterAttachmentSkip(t *testing.T) {
+	installationID := uuid.New()
+	organizationID := uuid.New()
+	agentID := uuid.New()
+	chatID := int64(55)
+	userID := int64(99)
+	threadID := uuid.New()
+	fileID := "file-123"
+	filePath := "files/" + fileID + ".bin"
+	data := make([]byte, 512)
+
+	server := newTelegramFileServer(t, "token", fileID, filePath, "application/octet-stream", data)
+	defer server.Close()
+
+	sendCalled := false
+	auditCalled := false
+	storeStub := &stubStore{
+		t: t,
+		getChatMappingFn: func(_ context.Context, installationArg uuid.UUID, chatIDArg int64) (store.ChatMapping, bool, error) {
+			if installationArg != installationID {
+				t.Fatalf("expected installation %s, got %s", installationID, installationArg)
+			}
+			if chatIDArg != chatID {
+				t.Fatalf("expected chat %d, got %d", chatID, chatIDArg)
+			}
+			return store.ChatMapping{
+				InstallationID: installationID,
+				TelegramChatID: chatID,
+				TelegramUserID: userID,
+				ThreadID:       threadID,
+			}, true, nil
+		},
+	}
+	gatewayStub := &stubGateway{
+		t: t,
+		sendMessageFn: func(context.Context, string, string, []string) error {
+			sendCalled = true
+			return nil
+		},
+		appendAuditFn: func(_ context.Context, installationArg, message string, level appsv1.InstallationAuditLogLevel, idempotencyKey string) error {
+			auditCalled = true
+			if installationArg != installationID.String() {
+				t.Fatalf("expected installation %s, got %s", installationID, installationArg)
+			}
+			if strings.TrimSpace(idempotencyKey) == "" {
+				t.Fatal("expected idempotency key")
+			}
+			return nil
+		},
+	}
+
+	worker := newInstallationWorker(Installation{
+		ID:             installationID,
+		OrganizationID: organizationID,
+		BotToken:       "token",
+		AgentID:        agentID,
+	}, storeStub, gatewayStub, server.URL, time.Second)
+
+	update := telegram.Update{Message: &telegram.Message{
+		From: &telegram.User{ID: userID},
+		Chat: telegram.Chat{ID: chatID, Type: "private"},
+		Document: &telegram.Document{
+			FileID:   fileID,
+			FileName: "file.bin",
+			MimeType: "",
+			FileSize: int64(len(data)),
+		},
+	}}
+
+	if err := worker.handleUpdate(context.Background(), update); err != nil {
+		t.Fatalf("handleUpdate returned error: %v", err)
+	}
+	if sendCalled {
+		t.Fatal("expected SendMessage not to be called")
+	}
+	if !auditCalled {
+		t.Fatal("expected audit log call")
+	}
+}

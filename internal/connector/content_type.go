@@ -9,6 +9,7 @@ import (
 
 const photoFallbackContentType = "image/jpeg"
 
+// Keep in sync with agynio/files internal/filetype allowlist.
 var allowedContentTypePrefixes = []string{
 	"image/",
 	"text/",

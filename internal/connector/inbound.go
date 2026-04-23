@@ -232,6 +232,10 @@ func (w *installationWorker) handleUpdate(ctx context.Context, update telegram.U
 	if err != nil {
 		return err
 	}
+	if strings.TrimSpace(body) == "" && len(fileIDs) == 0 {
+		log.Printf("connector: skip empty inbound message for chat %d", message.Chat.ID)
+		return nil
+	}
 	threadID := mapping.ThreadID
 	if err := w.gateway.SendMessage(ctx, threadID.String(), body, fileIDs); err != nil {
 		if !isThreadDegradedError(err) {
@@ -382,7 +386,6 @@ func (w *installationWorker) uploadTelegramFile(ctx context.Context, fileID, fil
 	if filename == "" {
 		filename = fileID
 	}
-	var contentTypeErr error
 	for _, contentType := range allowedContentTypes {
 		metadata := &filesv1.UploadFileMetadata{
 			Filename:    filename,
@@ -394,16 +397,12 @@ func (w *installationWorker) uploadTelegramFile(ctx context.Context, fileID, fil
 			return uploaded.GetId(), nil
 		}
 		if errors.Is(err, errUploadContentTypeNotAllowed) {
-			contentTypeErr = err
 			continue
 		}
 		return "", err
 	}
-	if contentTypeErr != nil {
-		w.logAttachmentSkipped(ctx, fileID, candidates)
-		return "", nil
-	}
-	return "", fmt.Errorf("upload file: no content type selected")
+	w.logAttachmentSkipped(ctx, fileID, candidates)
+	return "", nil
 }
 
 func (w *installationWorker) uploadWithRetries(ctx context.Context, metadata *filesv1.UploadFileMetadata, payload []byte) (*filesv1.FileInfo, error) {
@@ -433,14 +432,14 @@ func isUploadContentTypeNotAllowed(err error) bool {
 	if err == nil {
 		return false
 	}
-	if !strings.Contains(strings.ToLower(err.Error()), "content_type is not allowed") {
-		return false
-	}
 	var connectErr *connect.Error
 	if errors.As(err, &connectErr) {
-		return connectErr.Code() == connect.CodeInvalidArgument
+		if connectErr.Code() != connect.CodeInvalidArgument {
+			return false
+		}
+		return strings.Contains(strings.ToLower(connectErr.Message()), "content_type is not allowed")
 	}
-	return true
+	return strings.Contains(strings.ToLower(err.Error()), "content_type is not allowed")
 }
 
 func isUploadRetriableError(err error) bool {
