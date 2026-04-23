@@ -31,7 +31,7 @@ func TestInboundMedia(t *testing.T) {
 	filePath := "photos/" + fileID + ".jpg"
 	data := []byte("photo-data-" + uuid.NewString())
 
-	setTelegramFile(t, botToken, fileID, filePath, "image/jpeg", data)
+	setTelegramFile(t, botToken, fileID, filePath, "application/octet-stream", data)
 	enqueuePhotoUpdate(t, botToken, chatID, fileID, caption, int64(len(data)))
 	_, message := waitForMessage(t, caption, 1, 90*time.Second)
 
@@ -39,6 +39,7 @@ func TestInboundMedia(t *testing.T) {
 	uploadedID := message.GetFileIds()[0]
 	metadata := getFileMetadata(t, uploadedID)
 	require.Equal(t, int64(len(data)), metadata.GetSizeBytes())
+	require.Equal(t, "image/jpeg", metadata.GetContentType())
 	downloaded := downloadFile(t, uploadedID)
 	require.Equal(t, data, downloaded)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -20,6 +21,7 @@ import (
 
 const (
 	inboundRetryDelay     = time.Second
+	inboundUploadRetryMax = 3
 	degradedThreadMessage = "thread is degraded"
 )
 
@@ -230,6 +232,10 @@ func (w *installationWorker) handleUpdate(ctx context.Context, update telegram.U
 	if err != nil {
 		return err
 	}
+	if strings.TrimSpace(body) == "" && len(fileIDs) == 0 {
+		log.Printf("connector: skip empty inbound message for chat %d", message.Chat.ID)
+		return nil
+	}
 	threadID := mapping.ThreadID
 	if err := w.gateway.SendMessage(ctx, threadID.String(), body, fileIDs); err != nil {
 		if !isThreadDegradedError(err) {
@@ -307,39 +313,39 @@ func (w *installationWorker) buildInboundMessage(ctx context.Context, message *t
 	caption := strings.TrimSpace(message.Caption)
 	if len(message.Photo) > 0 {
 		photo := largestPhoto(message.Photo)
-		fileID, err := w.uploadTelegramFile(ctx, photo.FileID, "photo", "image/jpeg")
+		result, err := w.uploadTelegramFile(ctx, photo.FileID, "photo", "image/jpeg", true)
 		if err != nil {
 			return "", nil, err
 		}
-		return caption, []string{fileID}, nil
+		return applyAttachmentMarker(caption, result), fileIDsOrNil(result.fileID), nil
 	}
 	if message.Document != nil {
-		fileID, err := w.uploadTelegramFile(ctx, message.Document.FileID, message.Document.FileName, message.Document.MimeType)
+		result, err := w.uploadTelegramFile(ctx, message.Document.FileID, message.Document.FileName, message.Document.MimeType, false)
 		if err != nil {
 			return "", nil, err
 		}
-		return caption, []string{fileID}, nil
+		return applyAttachmentMarker(caption, result), fileIDsOrNil(result.fileID), nil
 	}
 	if message.Audio != nil {
-		fileID, err := w.uploadTelegramFile(ctx, message.Audio.FileID, message.Audio.FileName, message.Audio.MimeType)
+		result, err := w.uploadTelegramFile(ctx, message.Audio.FileID, message.Audio.FileName, message.Audio.MimeType, false)
 		if err != nil {
 			return "", nil, err
 		}
-		return caption, []string{fileID}, nil
+		return applyAttachmentMarker(caption, result), fileIDsOrNil(result.fileID), nil
 	}
 	if message.Video != nil {
-		fileID, err := w.uploadTelegramFile(ctx, message.Video.FileID, message.Video.FileName, message.Video.MimeType)
+		result, err := w.uploadTelegramFile(ctx, message.Video.FileID, message.Video.FileName, message.Video.MimeType, false)
 		if err != nil {
 			return "", nil, err
 		}
-		return caption, []string{fileID}, nil
+		return applyAttachmentMarker(caption, result), fileIDsOrNil(result.fileID), nil
 	}
 	if message.Voice != nil {
-		fileID, err := w.uploadTelegramFile(ctx, message.Voice.FileID, "voice", message.Voice.MimeType)
+		result, err := w.uploadTelegramFile(ctx, message.Voice.FileID, "voice", message.Voice.MimeType, false)
 		if err != nil {
 			return "", nil, err
 		}
-		return caption, []string{fileID}, nil
+		return applyAttachmentMarker(caption, result), fileIDsOrNil(result.fileID), nil
 	}
 	if message.Sticker != nil {
 		label := "[sticker]"
@@ -351,34 +357,160 @@ func (w *installationWorker) buildInboundMessage(ctx context.Context, message *t
 	return "[unsupported message]", nil, nil
 }
 
-func (w *installationWorker) uploadTelegramFile(ctx context.Context, fileID, filename, mimeType string) (string, error) {
+type uploadResult struct {
+	fileID     string
+	skipMarker string
+}
+
+func applyAttachmentMarker(caption string, result uploadResult) string {
+	marker := strings.TrimSpace(result.skipMarker)
+	if marker == "" {
+		return caption
+	}
+	if strings.TrimSpace(caption) == "" {
+		return marker
+	}
+	return fmt.Sprintf("%s\n%s", caption, marker)
+}
+
+func fileIDsOrNil(fileID string) []string {
+	if strings.TrimSpace(fileID) == "" {
+		return nil
+	}
+	return []string{fileID}
+}
+
+var errUploadContentTypeNotAllowed = errors.New("upload content_type not allowed")
+
+func (w *installationWorker) uploadTelegramFile(ctx context.Context, fileID, filename, mimeType string, requireImage bool) (uploadResult, error) {
 	file, err := w.telegramClient.GetFile(ctx, fileID)
 	if err != nil {
-		return "", err
+		return uploadResult{}, err
 	}
-	payload, contentType, err := w.telegramClient.DownloadFile(ctx, file.FilePath)
+	payload, headerContentType, err := w.telegramClient.DownloadFile(ctx, file.FilePath)
 	if err != nil {
-		return "", err
+		return uploadResult{}, err
 	}
-	if contentType == "" {
-		contentType = mimeType
-	}
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
+	sniffedContentType := http.DetectContentType(payload)
+	extensionType := extensionContentType(file.FilePath, filename)
+	candidates := buildContentTypeCandidates(mimeType, sniffedContentType, extensionType, headerContentType)
+	allowedContentTypes := selectAllowedContentTypes(candidates, requireImage)
 	if filename == "" {
 		filename = fileID
 	}
-	metadata := &filesv1.UploadFileMetadata{
-		Filename:    filename,
-		ContentType: contentType,
-		SizeBytes:   int64(len(payload)),
+	sizeBytes := int64(len(payload))
+	if len(allowedContentTypes) == 0 {
+		marker := w.handleAttachmentSkipped(ctx, fileID, filename, sizeBytes, candidates)
+		return uploadResult{skipMarker: marker}, nil
 	}
-	uploaded, err := w.gateway.UploadFile(ctx, metadata, payload)
-	if err != nil {
-		return "", err
+	for _, contentType := range allowedContentTypes {
+		metadata := &filesv1.UploadFileMetadata{
+			Filename:    filename,
+			ContentType: contentType,
+			SizeBytes:   sizeBytes,
+		}
+		uploaded, err := w.uploadWithRetries(ctx, metadata, payload)
+		if err == nil {
+			return uploadResult{fileID: uploaded.GetId()}, nil
+		}
+		if errors.Is(err, errUploadContentTypeNotAllowed) {
+			continue
+		}
+		return uploadResult{}, err
 	}
-	return uploaded.GetId(), nil
+	marker := w.handleAttachmentSkipped(ctx, fileID, filename, sizeBytes, candidates)
+	return uploadResult{skipMarker: marker}, nil
+}
+
+func (w *installationWorker) uploadWithRetries(ctx context.Context, metadata *filesv1.UploadFileMetadata, payload []byte) (*filesv1.FileInfo, error) {
+	attempts := 0
+	for {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		uploaded, err := w.gateway.UploadFile(ctx, metadata, payload)
+		if err == nil {
+			return uploaded, nil
+		}
+		if isUploadContentTypeNotAllowed(err) {
+			return nil, errUploadContentTypeNotAllowed
+		}
+		attempts++
+		if !isUploadRetriableError(err) || attempts >= inboundUploadRetryMax {
+			return nil, err
+		}
+		if !sleepContext(ctx, retryDelay(attempts)) {
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func isUploadContentTypeNotAllowed(err error) bool {
+	if err == nil {
+		return false
+	}
+	var connectErr *connect.Error
+	if errors.As(err, &connectErr) {
+		if connectErr.Code() != connect.CodeInvalidArgument {
+			return false
+		}
+		return strings.Contains(strings.ToLower(connectErr.Message()), "content_type is not allowed")
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "content_type is not allowed")
+}
+
+func isUploadRetriableError(err error) bool {
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	var connectErr *connect.Error
+	if errors.As(err, &connectErr) {
+		switch connectErr.Code() {
+		case connect.CodeUnavailable, connect.CodeDeadlineExceeded, connect.CodeInternal:
+			return true
+		}
+	}
+	return false
+}
+
+func (w *installationWorker) handleAttachmentSkipped(ctx context.Context, fileID, filename string, sizeBytes int64, candidates []contentTypeCandidate) string {
+	summary := formatContentTypeCandidates(candidates)
+	if strings.TrimSpace(summary) == "" {
+		summary = "none"
+	}
+	message := fmt.Sprintf("%s: file_id=%s content_types=%s", auditEventAttachmentSkipped, fileID, summary)
+	log.Printf("connector: attachment skipped: file_id=%s content_types=%s", fileID, summary)
+	if w.status != nil {
+		w.status.RecordError(time.Now().UTC(), message)
+	}
+	w.appendAudit(ctx, auditEvent{
+		name:           auditEventAttachmentSkipped,
+		message:        message,
+		level:          appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_WARNING,
+		idempotencyKey: auditKeyWithHash(auditEventAttachmentSkipped, w.installation.ID, fmt.Sprintf("%s:%s", fileID, summary)),
+	})
+	return formatAttachmentSkippedMarker(filename, sizeBytes, candidates, summary)
+}
+
+func formatAttachmentSkippedMarker(filename string, sizeBytes int64, candidates []contentTypeCandidate, summary string) string {
+	summary = strings.TrimSpace(summary)
+	if summary == "none" {
+		summary = ""
+	}
+	contentType := strings.TrimSpace(bestContentTypeDetail(candidates))
+	if contentType == "" {
+		contentType = summary
+	}
+	if contentType == "" {
+		contentType = "unknown"
+	}
+	parts := make([]string, 0, 3)
+	if strings.TrimSpace(filename) != "" {
+		parts = append(parts, fmt.Sprintf("name=%s", filename))
+	}
+	parts = append(parts, fmt.Sprintf("size=%d", sizeBytes))
+	parts = append(parts, fmt.Sprintf("content_type=%s", contentType))
+	return fmt.Sprintf("[attachment skipped: unsupported file type (%s)]", strings.Join(parts, ", "))
 }
 
 func isThreadDegradedError(err error) bool {

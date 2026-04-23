@@ -446,3 +446,173 @@ func TestHandleUpdateStopsAfterSecondDegradedSend(t *testing.T) {
 		t.Fatalf("handleUpdate returned error: %v", err)
 	}
 }
+
+func TestHandleUpdateAttachmentSkipSendsMarkerWithoutCaption(t *testing.T) {
+	installationID := uuid.New()
+	organizationID := uuid.New()
+	agentID := uuid.New()
+	chatID := int64(55)
+	userID := int64(99)
+	threadID := uuid.New()
+	fileID := "file-123"
+	filePath := "files/" + fileID + ".bin"
+	data := make([]byte, 512)
+
+	server := newTelegramFileServer(t, "token", fileID, filePath, "application/octet-stream", data)
+	defer server.Close()
+
+	sendCalled := false
+	auditCalled := false
+	storeStub := &stubStore{
+		t: t,
+		getChatMappingFn: func(_ context.Context, installationArg uuid.UUID, chatIDArg int64) (store.ChatMapping, bool, error) {
+			if installationArg != installationID {
+				t.Fatalf("expected installation %s, got %s", installationID, installationArg)
+			}
+			if chatIDArg != chatID {
+				t.Fatalf("expected chat %d, got %d", chatID, chatIDArg)
+			}
+			return store.ChatMapping{
+				InstallationID: installationID,
+				TelegramChatID: chatID,
+				TelegramUserID: userID,
+				ThreadID:       threadID,
+			}, true, nil
+		},
+	}
+	gatewayStub := &stubGateway{
+		t: t,
+		sendMessageFn: func(_ context.Context, threadArg, body string, fileIDs []string) error {
+			sendCalled = true
+			if threadArg != threadID.String() {
+				t.Fatalf("expected thread %s, got %s", threadID, threadArg)
+			}
+			if len(fileIDs) != 0 {
+				t.Fatalf("expected no file IDs, got %v", fileIDs)
+			}
+			if !strings.Contains(body, "attachment skipped: unsupported file type") {
+				t.Fatalf("expected marker in body, got %s", body)
+			}
+			if !strings.Contains(body, "name=file.bin") {
+				t.Fatalf("expected filename in body, got %s", body)
+			}
+			if !strings.Contains(body, "size=512") {
+				t.Fatalf("expected size in body, got %s", body)
+			}
+			if !strings.Contains(body, "content_type=application/octet-stream") {
+				t.Fatalf("expected content type in body, got %s", body)
+			}
+			return nil
+		},
+		appendAuditFn: func(_ context.Context, installationArg, message string, level appsv1.InstallationAuditLogLevel, idempotencyKey string) error {
+			auditCalled = true
+			if installationArg != installationID.String() {
+				t.Fatalf("expected installation %s, got %s", installationID, installationArg)
+			}
+			if strings.TrimSpace(idempotencyKey) == "" {
+				t.Fatal("expected idempotency key")
+			}
+			return nil
+		},
+	}
+
+	worker := newInstallationWorker(Installation{
+		ID:             installationID,
+		OrganizationID: organizationID,
+		BotToken:       "token",
+		AgentID:        agentID,
+	}, storeStub, gatewayStub, server.URL, time.Second)
+
+	update := telegram.Update{Message: &telegram.Message{
+		From: &telegram.User{ID: userID},
+		Chat: telegram.Chat{ID: chatID, Type: "private"},
+		Document: &telegram.Document{
+			FileID:   fileID,
+			FileName: "file.bin",
+			MimeType: "",
+			FileSize: int64(len(data)),
+		},
+	}}
+
+	if err := worker.handleUpdate(context.Background(), update); err != nil {
+		t.Fatalf("handleUpdate returned error: %v", err)
+	}
+	if !sendCalled {
+		t.Fatal("expected SendMessage to be called")
+	}
+	if !auditCalled {
+		t.Fatal("expected audit log call")
+	}
+}
+
+func TestHandleUpdateAttachmentSkipAppendsMarkerToCaption(t *testing.T) {
+	installationID := uuid.New()
+	organizationID := uuid.New()
+	agentID := uuid.New()
+	chatID := int64(56)
+	userID := int64(100)
+	threadID := uuid.New()
+	fileID := "file-456"
+	filePath := "files/" + fileID + ".bin"
+	data := make([]byte, 256)
+	caption := "caption text"
+
+	server := newTelegramFileServer(t, "token", fileID, filePath, "application/octet-stream", data)
+	defer server.Close()
+
+	storeStub := &stubStore{
+		t: t,
+		getChatMappingFn: func(_ context.Context, installationArg uuid.UUID, chatIDArg int64) (store.ChatMapping, bool, error) {
+			return store.ChatMapping{
+				InstallationID: installationID,
+				TelegramChatID: chatID,
+				TelegramUserID: userID,
+				ThreadID:       threadID,
+			}, true, nil
+		},
+	}
+	gatewayStub := &stubGateway{
+		t: t,
+		sendMessageFn: func(_ context.Context, threadArg, body string, fileIDs []string) error {
+			if threadArg != threadID.String() {
+				t.Fatalf("expected thread %s, got %s", threadID, threadArg)
+			}
+			if len(fileIDs) != 0 {
+				t.Fatalf("expected no file IDs, got %v", fileIDs)
+			}
+			if !strings.HasPrefix(body, caption+"\n") {
+				t.Fatalf("expected caption prefix, got %s", body)
+			}
+			if !strings.Contains(body, "attachment skipped: unsupported file type") {
+				t.Fatalf("expected marker in body, got %s", body)
+			}
+			return nil
+		},
+		appendAuditFn: func(context.Context, string, string, appsv1.InstallationAuditLogLevel, string) error {
+			return nil
+		},
+	}
+
+	worker := newInstallationWorker(Installation{
+		ID:             installationID,
+		OrganizationID: organizationID,
+		BotToken:       "token",
+		AgentID:        agentID,
+	}, storeStub, gatewayStub, server.URL, time.Second)
+
+	update := telegram.Update{Message: &telegram.Message{
+		From:    &telegram.User{ID: userID},
+		Chat:    telegram.Chat{ID: chatID, Type: "private"},
+		Caption: caption,
+		Document: &telegram.Document{
+			FileID:   fileID,
+			FileName: "file.bin",
+			MimeType: "",
+			FileSize: int64(len(data)),
+		},
+	}}
+
+	if err := worker.handleUpdate(context.Background(), update); err != nil {
+		t.Fatalf("handleUpdate returned error: %v", err)
+	}
+}
