@@ -43,7 +43,11 @@ type auditEvent struct {
 func (w *installationWorker) appendAudit(ctx context.Context, event auditEvent) {
 	key := strings.TrimSpace(event.idempotencyKey)
 	if key == "" {
-		key = auditKey(event.name, w.installation.ID.String(), strconv.FormatInt(time.Now().UTC().Unix(), 10))
+		log.Printf("connector: audit %s missing idempotency key", event.name)
+		if w.status != nil {
+			w.status.RecordError(time.Now().UTC(), fmt.Sprintf("audit %s missing idempotency key", event.name))
+		}
+		return
 	}
 	attempts := 0
 	for {

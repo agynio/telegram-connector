@@ -199,6 +199,8 @@ func (s *testState) reportInstallationStatus(installationID, status string) erro
 }
 
 func (s *testState) appendAudit(installationID, message string, level appsv1.InstallationAuditLogLevel, idempotencyKey *string) *appsv1.InstallationAuditLogEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	entries := s.auditLogs[installationID]
 	if idempotencyKey != nil {
 		for _, entry := range entries {

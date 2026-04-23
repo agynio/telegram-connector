@@ -8,6 +8,7 @@ import (
 	"time"
 
 	appsv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/apps/v1"
+	"github.com/agynio/telegram-connector/internal/store"
 	"github.com/agynio/telegram-connector/internal/telegram"
 )
 
@@ -22,6 +23,8 @@ type installationWorker struct {
 	status              *installationStatus
 	telegramFailureAt   time.Time
 	telegramUnreachable bool
+	runInboundFn        func(context.Context, store.InstallationState) error
+	runOutboundFn       func(context.Context) error
 }
 
 type stopReason int
@@ -29,10 +32,11 @@ type stopReason int
 const (
 	stopReasonShutdown stopReason = iota
 	stopReasonRemoved
+	stopReasonMisconfigured
 )
 
 func newInstallationWorker(installation Installation, store Store, gatewayClient Gateway, telegramBaseURL string, pollTimeout time.Duration) *installationWorker {
-	return &installationWorker{
+	worker := &installationWorker{
 		installation:   installation,
 		store:          store,
 		gateway:        gatewayClient,
@@ -40,6 +44,9 @@ func newInstallationWorker(installation Installation, store Store, gatewayClient
 		pollTimeout:    pollTimeout,
 		done:           make(chan struct{}),
 	}
+	worker.runInboundFn = worker.runInbound
+	worker.runOutboundFn = worker.runOutbound
+	return worker
 }
 
 func (w *installationWorker) Installation() Installation {
@@ -89,13 +96,13 @@ func (w *installationWorker) run(ctx context.Context) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		if err := w.runInbound(ctx, state); err != nil {
+		if err := w.runInboundFn(ctx, state); err != nil {
 			log.Printf("connector: inbound worker %s stopped: %v", w.installation.ID, err)
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		if err := w.runOutbound(ctx); err != nil {
+		if err := w.runOutboundFn(ctx); err != nil {
 			log.Printf("connector: outbound worker %s stopped: %v", w.installation.ID, err)
 		}
 	}()
@@ -118,6 +125,9 @@ func (w *installationWorker) reportStop(reason stopReason) {
 				w.status.RecordError(time.Now().UTC(), fmt.Sprintf("clear status: %v", err))
 			}
 		}
+		return
+	}
+	if reason == stopReasonMisconfigured {
 		return
 	}
 	if w.status != nil {

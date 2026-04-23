@@ -21,9 +21,11 @@ func TestBuildStatusIncludesMetrics(t *testing.T) {
 		LastError:          &statusError{message: "telegram status=500", at: timestamp},
 	})
 
+	if !strings.HasPrefix(status, "Healthy\n\n") {
+		t.Fatalf("expected status to start with headline, got %q", status)
+	}
 	checks := []string{
-		"**Healthy**",
-		"polling since " + timestamp.Format(time.RFC3339),
+		"- status_since: " + timestamp.Format(time.RFC3339),
 		"- last_update_at: " + timestamp.Format(time.RFC3339),
 		"- last_update_id: 184522",
 		"- active_chats: 47",

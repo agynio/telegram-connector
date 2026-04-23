@@ -213,7 +213,6 @@ func (s *installationStatus) Report(ctx context.Context) {
 	defer s.reportMu.Unlock()
 
 	now := time.Now().UTC()
-	snapshot := s.snapshot(now)
 	activeChats, err := s.store.CountActiveChats(ctx, s.installationID)
 	if err != nil {
 		log.Printf("connector: count active chats error: %v", err)
@@ -226,6 +225,7 @@ func (s *installationStatus) Report(ctx context.Context) {
 		s.RecordError(now, fmt.Sprintf("count blocked chats: %v", err))
 		blockedChats = 0
 	}
+	snapshot := s.snapshot(now)
 	status := buildStatus(statusMetrics{
 		State:              snapshot.state,
 		StartAt:            snapshot.startAt,
@@ -281,8 +281,9 @@ func (s *installationStatus) updateStateLocked() bool {
 }
 
 func buildStatus(metrics statusMetrics) string {
-	headline := fmt.Sprintf("**%s** — polling since %s", metrics.State, formatTimestamp(metrics.StartAt))
+	headline := string(metrics.State)
 	lines := []string{
+		fmt.Sprintf("- status_since: %s", formatTimestamp(metrics.StartAt)),
 		fmt.Sprintf("- last_update_at: %s", formatTimestamp(metrics.LastUpdateAt)),
 		fmt.Sprintf("- last_update_id: %d", metrics.LastUpdateID),
 		fmt.Sprintf("- active_chats: %d", metrics.ActiveChats),

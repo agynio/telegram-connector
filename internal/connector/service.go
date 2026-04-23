@@ -82,11 +82,11 @@ func NewService(store Store, gatewayClient Gateway, cfg ServiceConfig) *Service 
 
 func (s *Service) Run(ctx context.Context) error {
 	manager := newInstallationManager(s.store, s.gateway, s.telegramBaseURL, s.pollTimeout)
-	installations, err := s.listInstallations(ctx)
+	installations, misconfigured, err := s.listInstallations(ctx)
 	if err != nil {
 		return err
 	}
-	manager.Sync(ctx, installations)
+	manager.Sync(ctx, installations, misconfigured)
 
 	ticker := time.NewTicker(reconcileInterval)
 	defer ticker.Stop()
@@ -97,28 +97,30 @@ func (s *Service) Run(ctx context.Context) error {
 			manager.StopAll()
 			return nil
 		case <-ticker.C:
-			installations, err := s.listInstallations(ctx)
+			installations, misconfigured, err := s.listInstallations(ctx)
 			if err != nil {
 				log.Printf("connector: reconcile installations error: %v", err)
 				continue
 			}
-			manager.Sync(ctx, installations)
+			manager.Sync(ctx, installations, misconfigured)
 		}
 	}
 }
 
-func (s *Service) listInstallations(ctx context.Context) ([]Installation, error) {
+func (s *Service) listInstallations(ctx context.Context) ([]Installation, map[uuid.UUID]struct{}, error) {
 	installations, err := s.gateway.ListInstallations(ctx, s.appID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	resolved := make([]Installation, 0, len(installations))
+	misconfigured := make(map[uuid.UUID]struct{})
 	for _, installation := range installations {
 		parsed, err := s.parseInstallation(ctx, installation)
 		if err != nil {
 			var configErr *installationConfigError
 			if errors.As(err, &configErr) {
 				s.reportConfigurationInvalid(ctx, configErr.installationID, configErr.message)
+				misconfigured[configErr.installationID] = struct{}{}
 				continue
 			}
 			installationID := ""
@@ -134,7 +136,7 @@ func (s *Service) listInstallations(ctx context.Context) ([]Installation, error)
 		}
 		resolved = append(resolved, parsed)
 	}
-	return resolved, nil
+	return resolved, misconfigured, nil
 }
 
 func (s *Service) parseInstallation(ctx context.Context, installation *appsv1.Installation) (Installation, error) {
@@ -221,7 +223,7 @@ func newInstallationManager(store Store, gatewayClient Gateway, telegramBaseURL 
 	}
 }
 
-func (m *installationManager) Sync(ctx context.Context, installations []Installation) {
+func (m *installationManager) Sync(ctx context.Context, installations []Installation, misconfigured map[uuid.UUID]struct{}) {
 	desired := make(map[uuid.UUID]Installation, len(installations))
 	for _, installation := range installations {
 		desired[installation.ID] = installation
@@ -231,10 +233,16 @@ func (m *installationManager) Sync(ctx context.Context, installations []Installa
 	defer m.mu.Unlock()
 
 	for id, worker := range m.workers {
-		if _, ok := desired[id]; !ok {
-			worker.Stop(stopReasonRemoved)
-			delete(m.workers, id)
+		if _, ok := desired[id]; ok {
+			continue
 		}
+		if _, ok := misconfigured[id]; ok {
+			worker.Stop(stopReasonMisconfigured)
+			delete(m.workers, id)
+			continue
+		}
+		worker.Stop(stopReasonRemoved)
+		delete(m.workers, id)
 	}
 
 	for id, installation := range desired {

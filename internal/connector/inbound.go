@@ -120,10 +120,8 @@ func (w *installationWorker) handlePollError(ctx context.Context, now time.Time,
 
 func (w *installationWorker) handlePollSuccess(ctx context.Context, now time.Time) {
 	wasUnreachable := w.telegramUnreachable
-	wasRejected := false
 	stateChanged := false
 	if w.status != nil {
-		wasRejected = w.status.TokenRejected()
 		if w.status.SetTokenRejected(false) {
 			stateChanged = true
 		}
@@ -131,7 +129,7 @@ func (w *installationWorker) handlePollSuccess(ctx context.Context, now time.Tim
 			stateChanged = true
 		}
 	}
-	if wasUnreachable || wasRejected {
+	if wasUnreachable {
 		w.appendAudit(ctx, auditEvent{
 			name:           auditEventTelegramRecovered,
 			message:        fmt.Sprintf("%s: getUpdates recovered at %s", auditEventTelegramRecovered, formatTimestamp(now)),

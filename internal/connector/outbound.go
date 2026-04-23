@@ -253,16 +253,25 @@ func (w *installationWorker) logOutboundFailure(ctx context.Context, message *th
 		}
 	}
 	detail := formatStatusError(err)
-	if detail == "" {
-		detail = "unknown"
+	if strings.TrimSpace(detail) == "" {
+		log.Printf("connector: outbound failure missing error detail for message %s", message.GetId())
+		if w.status != nil {
+			w.status.RecordError(time.Now().UTC(), "outbound failure missing error detail")
+		}
+		return
 	}
-	key := auditKey(auditEventOutboundFailed, w.installation.ID.String(), message.GetId())
-	if message.GetId() == "" {
-		key = auditKeyWithTime(auditEventOutboundFailed, w.installation.ID, time.Now().UTC(), message.GetThreadId())
+	messageID := strings.TrimSpace(message.GetId())
+	if messageID == "" {
+		log.Printf("connector: outbound failure missing message id for thread %s", message.GetThreadId())
+		if w.status != nil {
+			w.status.RecordError(time.Now().UTC(), "outbound failure missing message id")
+		}
+		return
 	}
+	key := auditKey(auditEventOutboundFailed, w.installation.ID.String(), messageID)
 	w.appendAudit(ctx, auditEvent{
 		name:           auditEventOutboundFailed,
-		message:        fmt.Sprintf("%s: thread_id=%s message_id=%s error=%s", auditEventOutboundFailed, message.GetThreadId(), message.GetId(), detail),
+		message:        fmt.Sprintf("%s: thread_id=%s message_id=%s error=%s", auditEventOutboundFailed, message.GetThreadId(), messageID, detail),
 		level:          appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_ERROR,
 		idempotencyKey: key,
 	})

@@ -92,13 +92,15 @@ func (c *Client) ReportInstallationStatus(ctx context.Context, installationID, s
 }
 
 func (c *Client) AppendInstallationAuditLogEntry(ctx context.Context, installationID, message string, level appsv1.InstallationAuditLogLevel, idempotencyKey string) error {
+	key := strings.TrimSpace(idempotencyKey)
+	if key == "" {
+		return fmt.Errorf("append installation audit log entry: idempotency key required")
+	}
 	request := &appsv1.AppendInstallationAuditLogEntryRequest{
 		InstallationId: installationID,
 		Message:        message,
 		Level:          level,
-	}
-	if strings.TrimSpace(idempotencyKey) != "" {
-		request.IdempotencyKey = &idempotencyKey
+		IdempotencyKey: &key,
 	}
 	_, err := c.apps.AppendInstallationAuditLogEntry(ctx, connect.NewRequest(request))
 	if err != nil {
