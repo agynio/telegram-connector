@@ -8,6 +8,15 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
+type installationConfigError struct {
+	installationID uuid.UUID
+	message        string
+}
+
+func (e *installationConfigError) Error() string {
+	return e.message
+}
+
 func parseInstallationConfig(config *structpb.Struct) (string, uuid.UUID, error) {
 	if config == nil {
 		return "", uuid.Nil, fmt.Errorf("installation configuration is missing")

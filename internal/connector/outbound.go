@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	appsv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/apps/v1"
 	filesv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/files/v1"
 	threadsv1 "github.com/agynio/telegram-connector/.gen/go/agynio/api/threads/v1"
 	"github.com/agynio/telegram-connector/internal/store"
@@ -74,12 +76,18 @@ func (w *installationWorker) subscribeNotifications(ctx context.Context, trigger
 }
 
 func (w *installationWorker) processOutbound(ctx context.Context) {
+	if w.status != nil && w.status.TokenRejected() {
+		return
+	}
 	messages, err := w.gateway.GetUnackedMessages(ctx)
 	if err != nil {
 		log.Printf("connector: get unacked messages error: %v", err)
 		return
 	}
 	for _, message := range messages {
+		if w.status != nil && w.status.TokenRejected() {
+			return
+		}
 		shouldAck := false
 		if message.GetSenderId() == w.gateway.AppIdentityID() {
 			shouldAck = true
@@ -103,8 +111,17 @@ func (w *installationWorker) processOutbound(ctx context.Context) {
 				} else {
 					blocked, err := w.deliverOutboundMessage(ctx, mapping, message)
 					if blocked {
-						if err := w.store.MarkChatBlocked(ctx, w.installation.ID, mapping.TelegramChatID); err != nil {
-							log.Printf("connector: mark chat blocked error: %v", err)
+						marked, markErr := w.store.MarkChatBlocked(ctx, w.installation.ID, mapping.TelegramChatID)
+						if markErr != nil {
+							log.Printf("connector: mark chat blocked error: %v", markErr)
+						}
+						if marked {
+							w.appendAudit(ctx, auditEvent{
+								name:           auditEventBotBlocked,
+								message:        fmt.Sprintf("%s: chat_id=%d", auditEventBotBlocked, mapping.TelegramChatID),
+								level:          appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_INFO,
+								idempotencyKey: auditKeyWithTime(auditEventBotBlocked, w.installation.ID, time.Now().UTC(), fmt.Sprintf("chat-%d", mapping.TelegramChatID)),
+							})
 						}
 						shouldAck = true
 					}
@@ -113,6 +130,7 @@ func (w *installationWorker) processOutbound(ctx context.Context) {
 							return
 						}
 						log.Printf("connector: deliver outbound error: %v", err)
+						w.logOutboundFailure(ctx, message, err)
 						shouldAck = true
 					} else {
 						shouldAck = true
@@ -219,6 +237,46 @@ func (w *installationWorker) fetchGatewayFile(ctx context.Context, fileID string
 	}
 }
 
+func (w *installationWorker) logOutboundFailure(ctx context.Context, message *threadsv1.Message, err error) {
+	if message == nil {
+		return
+	}
+	if w.status != nil && w.status.TokenRejected() {
+		var apiErr *telegram.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnauthorized {
+			return
+		}
+	}
+	if w.status != nil {
+		if w.status.SetOutboundDegraded(true) {
+			w.status.Report(ctx)
+		}
+	}
+	detail := formatStatusError(err)
+	if strings.TrimSpace(detail) == "" {
+		log.Printf("connector: outbound failure missing error detail for message %s", message.GetId())
+		if w.status != nil {
+			w.status.RecordError(time.Now().UTC(), "outbound failure missing error detail")
+		}
+		return
+	}
+	messageID := strings.TrimSpace(message.GetId())
+	if messageID == "" {
+		log.Printf("connector: outbound failure missing message id for thread %s", message.GetThreadId())
+		if w.status != nil {
+			w.status.RecordError(time.Now().UTC(), "outbound failure missing message id")
+		}
+		return
+	}
+	key := auditKey(auditEventOutboundFailed, w.installation.ID.String(), messageID)
+	w.appendAudit(ctx, auditEvent{
+		name:           auditEventOutboundFailed,
+		message:        fmt.Sprintf("%s: thread_id=%s message_id=%s error=%s", auditEventOutboundFailed, message.GetThreadId(), messageID, detail),
+		level:          appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_ERROR,
+		idempotencyKey: key,
+	})
+}
+
 func (w *installationWorker) sendWithRetry(ctx context.Context, send func(context.Context) error) (bool, error) {
 	rateBackoff := outboundRetryBase
 	attempts := 0
@@ -228,11 +286,29 @@ func (w *installationWorker) sendWithRetry(ctx context.Context, send func(contex
 		}
 		err := send(ctx)
 		if err == nil {
+			if w.status != nil {
+				now := time.Now().UTC()
+				w.status.RecordOutbound(now)
+				if w.status.SetOutboundDegraded(false) {
+					w.status.Report(ctx)
+				}
+			}
 			return false, nil
 		}
 		var apiErr *telegram.APIError
 		if errors.As(err, &apiErr) {
+			if apiErr.StatusCode == http.StatusUnauthorized {
+				now := time.Now().UTC()
+				if w.status != nil {
+					w.status.RecordError(now, formatStatusError(err))
+				}
+				w.handleTokenRejected(ctx, now)
+				return false, err
+			}
 			if apiErr.IsBlocked() {
+				if w.status != nil {
+					w.status.RecordError(time.Now().UTC(), formatStatusError(err))
+				}
 				return true, err
 			}
 			if apiErr.IsRateLimit() {
@@ -256,10 +332,16 @@ func (w *installationWorker) sendWithRetry(ctx context.Context, send func(contex
 				}
 				continue
 			}
+			if w.status != nil {
+				w.status.RecordError(time.Now().UTC(), formatStatusError(err))
+			}
 			return false, err
 		}
 		attempts++
 		if attempts > outboundRetryMax {
+			if w.status != nil {
+				w.status.RecordError(time.Now().UTC(), formatStatusError(err))
+			}
 			return false, err
 		}
 		if !sleepContext(ctx, retryDelay(attempts)) {

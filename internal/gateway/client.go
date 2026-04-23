@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 
 	"connectrpc.com/connect"
 	"github.com/openziti/sdk-golang/ziti"
@@ -77,6 +78,35 @@ func (c *Client) ListInstallations(ctx context.Context, appID string) ([]*appsv1
 			return installations, nil
 		}
 	}
+}
+
+func (c *Client) ReportInstallationStatus(ctx context.Context, installationID, status string) error {
+	_, err := c.apps.ReportInstallationStatus(ctx, connect.NewRequest(&appsv1.ReportInstallationStatusRequest{
+		InstallationId: installationID,
+		Status:         status,
+	}))
+	if err != nil {
+		return fmt.Errorf("report installation status: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) AppendInstallationAuditLogEntry(ctx context.Context, installationID, message string, level appsv1.InstallationAuditLogLevel, idempotencyKey string) error {
+	key := strings.TrimSpace(idempotencyKey)
+	if key == "" {
+		return fmt.Errorf("append installation audit log entry: idempotency key required")
+	}
+	request := &appsv1.AppendInstallationAuditLogEntryRequest{
+		InstallationId: installationID,
+		Message:        message,
+		Level:          level,
+		IdempotencyKey: &key,
+	}
+	_, err := c.apps.AppendInstallationAuditLogEntry(ctx, connect.NewRequest(request))
+	if err != nil {
+		return fmt.Errorf("append installation audit log entry: %w", err)
+	}
+	return nil
 }
 
 func (c *Client) CreateThread(ctx context.Context, organizationID string) (*threadsv1.Thread, error) {

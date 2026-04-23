@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -24,9 +25,11 @@ type Store interface {
 	GetChatMappingByThreadID(ctx context.Context, installationID, threadID uuid.UUID) (store.ChatMapping, bool, error)
 	CreateChatMapping(ctx context.Context, input store.ChatMappingInput) (store.ChatMapping, error)
 	DeleteChatMapping(ctx context.Context, installationID uuid.UUID, chatID int64) error
-	ClearChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) error
-	MarkChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) error
-	GetInstallationState(ctx context.Context, installationID uuid.UUID) (int64, error)
+	ClearChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) (bool, error)
+	MarkChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) (bool, error)
+	CountActiveChats(ctx context.Context, installationID uuid.UUID) (int64, error)
+	CountBlockedChats(ctx context.Context, installationID uuid.UUID) (int64, error)
+	GetInstallationState(ctx context.Context, installationID uuid.UUID) (store.InstallationState, error)
 	UpsertInstallationState(ctx context.Context, installationID uuid.UUID, lastUpdateID int64) error
 }
 
@@ -42,6 +45,8 @@ type Gateway interface {
 	UploadFile(ctx context.Context, metadata *filesv1.UploadFileMetadata, payload []byte) (*filesv1.FileInfo, error)
 	GetFileMetadata(ctx context.Context, fileID string) (*filesv1.FileInfo, error)
 	GetFileContent(ctx context.Context, fileID string) ([]byte, error)
+	ReportInstallationStatus(ctx context.Context, installationID, status string) error
+	AppendInstallationAuditLogEntry(ctx context.Context, installationID, message string, level appsv1.InstallationAuditLogLevel, idempotencyKey string) error
 }
 
 type Service struct {
@@ -77,11 +82,11 @@ func NewService(store Store, gatewayClient Gateway, cfg ServiceConfig) *Service 
 
 func (s *Service) Run(ctx context.Context) error {
 	manager := newInstallationManager(s.store, s.gateway, s.telegramBaseURL, s.pollTimeout)
-	installations, err := s.listInstallations(ctx)
+	installations, misconfigured, err := s.listInstallations(ctx)
 	if err != nil {
 		return err
 	}
-	manager.Sync(ctx, installations)
+	manager.Sync(ctx, installations, misconfigured)
 
 	ticker := time.NewTicker(reconcileInterval)
 	defer ticker.Stop()
@@ -92,25 +97,32 @@ func (s *Service) Run(ctx context.Context) error {
 			manager.StopAll()
 			return nil
 		case <-ticker.C:
-			installations, err := s.listInstallations(ctx)
+			installations, misconfigured, err := s.listInstallations(ctx)
 			if err != nil {
 				log.Printf("connector: reconcile installations error: %v", err)
 				continue
 			}
-			manager.Sync(ctx, installations)
+			manager.Sync(ctx, installations, misconfigured)
 		}
 	}
 }
 
-func (s *Service) listInstallations(ctx context.Context) ([]Installation, error) {
+func (s *Service) listInstallations(ctx context.Context) ([]Installation, map[uuid.UUID]struct{}, error) {
 	installations, err := s.gateway.ListInstallations(ctx, s.appID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	resolved := make([]Installation, 0, len(installations))
+	misconfigured := make(map[uuid.UUID]struct{})
 	for _, installation := range installations {
 		parsed, err := s.parseInstallation(ctx, installation)
 		if err != nil {
+			var configErr *installationConfigError
+			if errors.As(err, &configErr) {
+				s.reportConfigurationInvalid(ctx, configErr.installationID, configErr.message)
+				misconfigured[configErr.installationID] = struct{}{}
+				continue
+			}
 			installationID := ""
 			appID := ""
 			if installation != nil {
@@ -124,7 +136,7 @@ func (s *Service) listInstallations(ctx context.Context) ([]Installation, error)
 		}
 		resolved = append(resolved, parsed)
 	}
-	return resolved, nil
+	return resolved, misconfigured, nil
 }
 
 func (s *Service) parseInstallation(ctx context.Context, installation *appsv1.Installation) (Installation, error) {
@@ -141,7 +153,7 @@ func (s *Service) parseInstallation(ctx context.Context, installation *appsv1.In
 	}
 	botToken, agentID, err := parseInstallationConfig(installation.GetConfiguration())
 	if err != nil {
-		return Installation{}, err
+		return Installation{}, &installationConfigError{installationID: installationID, message: err.Error()}
 	}
 	return Installation{
 		ID:             installationID,
@@ -149,6 +161,47 @@ func (s *Service) parseInstallation(ctx context.Context, installation *appsv1.In
 		BotToken:       botToken,
 		AgentID:        agentID,
 	}, nil
+}
+
+func (s *Service) reportConfigurationInvalid(ctx context.Context, installationID uuid.UUID, message string) {
+	now := time.Now().UTC()
+	state, err := s.store.GetInstallationState(ctx, installationID)
+	if err != nil {
+		log.Printf("connector: get installation state for %s error: %v", installationID, err)
+	}
+	lastUpdateAt := state.UpdatedAt
+	if lastUpdateAt.IsZero() {
+		lastUpdateAt = now
+	}
+	activeChats, err := s.store.CountActiveChats(ctx, installationID)
+	if err != nil {
+		log.Printf("connector: count active chats for %s error: %v", installationID, err)
+		activeChats = 0
+	}
+	blockedChats, err := s.store.CountBlockedChats(ctx, installationID)
+	if err != nil {
+		log.Printf("connector: count blocked chats for %s error: %v", installationID, err)
+		blockedChats = 0
+	}
+	status := buildStatus(statusMetrics{
+		State:              statusMisconfigured,
+		StartAt:            now,
+		LastUpdateAt:       lastUpdateAt,
+		LastUpdateID:       state.LastUpdateID,
+		ActiveChats:        activeChats,
+		BlockedChats:       blockedChats,
+		InboundMessages1h:  0,
+		OutboundMessages1h: 0,
+		LastOutboundAt:     lastUpdateAt,
+		LastError:          &statusError{message: message, at: now},
+	})
+	if err := s.gateway.ReportInstallationStatus(ctx, installationID.String(), status); err != nil {
+		log.Printf("connector: report status for %s error: %v", installationID, err)
+	}
+	auditMessage := fmt.Sprintf("%s: %s", auditEventConfigurationInvalid, message)
+	if err := s.gateway.AppendInstallationAuditLogEntry(ctx, installationID.String(), auditMessage, appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_ERROR, auditKeyWithHash(auditEventConfigurationInvalid, installationID, message)); err != nil {
+		log.Printf("connector: append audit log for %s error: %v", installationID, err)
+	}
 }
 
 type installationManager struct {
@@ -170,7 +223,7 @@ func newInstallationManager(store Store, gatewayClient Gateway, telegramBaseURL 
 	}
 }
 
-func (m *installationManager) Sync(ctx context.Context, installations []Installation) {
+func (m *installationManager) Sync(ctx context.Context, installations []Installation, misconfigured map[uuid.UUID]struct{}) {
 	desired := make(map[uuid.UUID]Installation, len(installations))
 	for _, installation := range installations {
 		desired[installation.ID] = installation
@@ -180,10 +233,16 @@ func (m *installationManager) Sync(ctx context.Context, installations []Installa
 	defer m.mu.Unlock()
 
 	for id, worker := range m.workers {
-		if _, ok := desired[id]; !ok {
-			worker.Stop()
-			delete(m.workers, id)
+		if _, ok := desired[id]; ok {
+			continue
 		}
+		if _, ok := misconfigured[id]; ok {
+			worker.Stop(stopReasonMisconfigured)
+			delete(m.workers, id)
+			continue
+		}
+		worker.Stop(stopReasonRemoved)
+		delete(m.workers, id)
 	}
 
 	for id, installation := range desired {
@@ -192,7 +251,7 @@ func (m *installationManager) Sync(ctx context.Context, installations []Installa
 			continue
 		}
 		if ok {
-			worker.Stop()
+			worker.Stop(stopReasonShutdown)
 			delete(m.workers, id)
 		}
 		newWorker := newInstallationWorker(installation, m.store, m.gateway, m.telegramBaseURL, m.pollTimeout)
@@ -211,7 +270,7 @@ func (m *installationManager) StopAll() {
 	m.mu.Unlock()
 
 	for _, worker := range workers {
-		worker.Stop()
+		worker.Stop(stopReasonShutdown)
 	}
 }
 

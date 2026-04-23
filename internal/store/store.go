@@ -32,6 +32,11 @@ type ChatMappingInput struct {
 	ThreadID       uuid.UUID
 }
 
+type InstallationState struct {
+	LastUpdateID int64
+	UpdatedAt    time.Time
+}
+
 func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
@@ -96,42 +101,68 @@ func (s *Store) DeleteChatMapping(ctx context.Context, installationID uuid.UUID,
 	return nil
 }
 
-func (s *Store) ClearChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) error {
-	if _, err := s.pool.Exec(ctx, `
+func (s *Store) ClearChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) (bool, error) {
+	result, err := s.pool.Exec(ctx, `
         UPDATE chat_mappings
         SET blocked_at = NULL
         WHERE installation_id = $1 AND telegram_chat_id = $2 AND blocked_at IS NOT NULL
-    `, installationID, chatID); err != nil {
-		return fmt.Errorf("clear chat blocked: %w", err)
+    `, installationID, chatID)
+	if err != nil {
+		return false, fmt.Errorf("clear chat blocked: %w", err)
 	}
-	return nil
+	return result.RowsAffected() > 0, nil
 }
 
-func (s *Store) MarkChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) error {
-	if _, err := s.pool.Exec(ctx, `
+func (s *Store) MarkChatBlocked(ctx context.Context, installationID uuid.UUID, chatID int64) (bool, error) {
+	result, err := s.pool.Exec(ctx, `
         UPDATE chat_mappings
         SET blocked_at = NOW()
-        WHERE installation_id = $1 AND telegram_chat_id = $2
-    `, installationID, chatID); err != nil {
-		return fmt.Errorf("mark chat blocked: %w", err)
+        WHERE installation_id = $1 AND telegram_chat_id = $2 AND blocked_at IS NULL
+    `, installationID, chatID)
+	if err != nil {
+		return false, fmt.Errorf("mark chat blocked: %w", err)
 	}
-	return nil
+	return result.RowsAffected() > 0, nil
 }
 
-func (s *Store) GetInstallationState(ctx context.Context, installationID uuid.UUID) (int64, error) {
-	var lastUpdate int64
+func (s *Store) CountActiveChats(ctx context.Context, installationID uuid.UUID) (int64, error) {
+	var count int64
+	if err := s.pool.QueryRow(ctx, `
+        SELECT COUNT(*)
+        FROM chat_mappings
+        WHERE installation_id = $1 AND blocked_at IS NULL
+    `, installationID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count active chats: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Store) CountBlockedChats(ctx context.Context, installationID uuid.UUID) (int64, error) {
+	var count int64
+	if err := s.pool.QueryRow(ctx, `
+        SELECT COUNT(*)
+        FROM chat_mappings
+        WHERE installation_id = $1 AND blocked_at IS NOT NULL
+    `, installationID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count blocked chats: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Store) GetInstallationState(ctx context.Context, installationID uuid.UUID) (InstallationState, error) {
+	var state InstallationState
 	err := s.pool.QueryRow(ctx, `
-        SELECT last_update_id
+        SELECT last_update_id, updated_at
         FROM installation_state
         WHERE installation_id = $1
-    `, installationID).Scan(&lastUpdate)
+    `, installationID).Scan(&state.LastUpdateID, &state.UpdatedAt)
 	if err == nil {
-		return lastUpdate, nil
+		return state, nil
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, nil
+		return InstallationState{}, nil
 	}
-	return 0, fmt.Errorf("get installation state: %w", err)
+	return InstallationState{}, fmt.Errorf("get installation state: %w", err)
 }
 
 func (s *Store) UpsertInstallationState(ctx context.Context, installationID uuid.UUID, lastUpdateID int64) error {
