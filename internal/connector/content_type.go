@@ -137,6 +137,18 @@ func formatContentTypeCandidates(candidates []contentTypeCandidate) string {
 	return strings.Join(parts, ", ")
 }
 
+func bestContentTypeDetail(candidates []contentTypeCandidate) string {
+	for _, candidate := range candidates {
+		if candidate.normalized != "" {
+			return candidate.normalized
+		}
+		if strings.TrimSpace(candidate.raw) != "" {
+			return strings.TrimSpace(candidate.raw)
+		}
+	}
+	return ""
+}
+
 func extensionContentType(filePath, filename string) string {
 	extension := path.Ext(filePath)
 	if extension == "" {

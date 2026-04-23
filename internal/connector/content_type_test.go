@@ -97,12 +97,21 @@ func TestUploadTelegramFileSkipsDisallowedContentTypes(t *testing.T) {
 		AgentID:        uuid.New(),
 	}, storeStub, gatewayStub, server.URL, time.Second)
 
-	uploadedID, err := worker.uploadTelegramFile(context.Background(), fileID, "", "", false)
+	result, err := worker.uploadTelegramFile(context.Background(), fileID, "", "", false)
 	if err != nil {
 		t.Fatalf("uploadTelegramFile returned error: %v", err)
 	}
-	if uploadedID != "" {
-		t.Fatalf("expected no upload id, got %s", uploadedID)
+	if result.fileID != "" {
+		t.Fatalf("expected no upload id, got %s", result.fileID)
+	}
+	if !strings.Contains(result.skipMarker, "attachment skipped") {
+		t.Fatalf("expected skip marker, got %s", result.skipMarker)
+	}
+	if !strings.Contains(result.skipMarker, "size=512") {
+		t.Fatalf("expected size detail, got %s", result.skipMarker)
+	}
+	if !strings.Contains(result.skipMarker, "content_type=application/octet-stream") {
+		t.Fatalf("expected content type detail, got %s", result.skipMarker)
 	}
 	if !auditCalled {
 		t.Fatal("expected audit log call")
