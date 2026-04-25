@@ -256,5 +256,12 @@ func (c *Client) GetFileContent(ctx context.Context, fileID string) ([]byte, err
 }
 
 func (c *Client) Subscribe(ctx context.Context) (*connect.ServerStreamForClient[notificationsv1.SubscribeResponse], error) {
-	return c.notifications.Subscribe(ctx, connect.NewRequest(&notificationsv1.SubscribeRequest{}))
+	appIdentityID := strings.TrimSpace(c.appIdentityID)
+	if appIdentityID == "" {
+		return nil, fmt.Errorf("subscribe notifications: app identity id required")
+	}
+	request := &notificationsv1.SubscribeRequest{
+		Rooms: []string{fmt.Sprintf("thread_participant:%s", appIdentityID)},
+	}
+	return c.notifications.Subscribe(ctx, connect.NewRequest(request))
 }
